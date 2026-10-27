@@ -53,13 +53,40 @@ func Dir() (string, error) {
 	return filepath.Join(base, appName), nil
 }
 
+// StateDir returns where the sync database lives: %LocalAppData%\cloudsync
+// on Windows and $XDG_STATE_HOME/cloudsync (default ~/.local/state) on
+// Linux. CLOUDSYNC_STATE_DIR overrides it.
+func StateDir() (string, error) {
+	if d := os.Getenv("CLOUDSYNC_STATE_DIR"); d != "" {
+		return d, nil
+	}
+	if runtime.GOOS == "windows" {
+		d := os.Getenv("LOCALAPPDATA")
+		if d == "" {
+			return "", errors.New("%LOCALAPPDATA% is not set")
+		}
+		return filepath.Join(d, appName), nil
+	}
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
+		return filepath.Join(d, appName), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "state", appName), nil
+}
+
 // Load reads config.toml from dir, falling back to Default when the file
-// does not exist.
+// does not exist. CLOUDSYNC_CONFIG names a different file, which must exist.
 func Load(dir string) (Config, error) {
-	p := filepath.Join(dir, "config.toml")
+	p, explicit := os.Getenv("CLOUDSYNC_CONFIG"), true
+	if p == "" {
+		p, explicit = filepath.Join(dir, "config.toml"), false
+	}
 	var c Config
 	if _, err := toml.DecodeFile(p, &c); err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if errors.Is(err, fs.ErrNotExist) && !explicit {
 			return Default(), nil
 		}
 		return Config{}, fmt.Errorf("reading %s: %w", p, err)

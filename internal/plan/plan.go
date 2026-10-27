@@ -28,10 +28,11 @@ func (k Kind) String() string {
 // Item is one path in the plan. Size is the local size for uploads and
 // conflicts, the Drive size for downloads, and 0 for files already in sync.
 type Item struct {
-	Rel  string
-	Kind Kind
-	Size int64
-	Note string
+	Rel      string // local path, or the Drive path for downloads
+	DriveRel string // matching Drive path; differs from Rel only by letter case, and is empty for uploads
+	Kind     Kind
+	Size     int64
+	Note     string
 }
 
 // Plan is the ordered list of items.
@@ -83,8 +84,8 @@ func FirstSync(local []localfs.File, remote []gdrive.File, hash Hasher) *Plan {
 	}
 
 	p := &Plan{}
-	add := func(rel string, k Kind, size int64, note string) {
-		p.Items = append(p.Items, Item{Rel: rel, Kind: k, Size: size, Note: note})
+	add := func(rel, driveRel string, k Kind, size int64, note string) {
+		p.Items = append(p.Items, Item{Rel: rel, DriveRel: driveRel, Kind: k, Size: size, Note: note})
 	}
 	matched := make(map[string]bool)
 	for _, lf := range local {
@@ -93,33 +94,33 @@ func FirstSync(local []localfs.File, remote []gdrive.File, hash Hasher) *Plan {
 			// Windows paths ignore case, so a case-only difference is the same file there.
 			if other, ok := byLower[strings.ToLower(lf.Rel)]; ok {
 				matched[other] = true
-				add(lf.Rel, Conflict, lf.Size, fmt.Sprintf("Drive has %q, which differs only by letter case", other))
+				add(lf.Rel, other, Conflict, lf.Size, fmt.Sprintf("Drive has %q, which differs only by letter case", other))
 			} else {
-				add(lf.Rel, Upload, lf.Size, "")
+				add(lf.Rel, "", Upload, lf.Size, "")
 			}
 			continue
 		}
 		matched[lf.Rel] = true
 		switch {
 		case rf.Size != lf.Size:
-			add(lf.Rel, Conflict, lf.Size, "different size")
+			add(lf.Rel, rf.Rel, Conflict, lf.Size, "different size")
 		case rf.MD5 == "":
-			add(lf.Rel, Conflict, lf.Size, "Drive has no checksum to compare")
+			add(lf.Rel, rf.Rel, Conflict, lf.Size, "Drive has no checksum to compare")
 		default:
 			sum, err := hash(lf.Rel)
 			switch {
 			case err != nil:
-				add(lf.Rel, Conflict, lf.Size, "could not read local file: "+err.Error())
+				add(lf.Rel, rf.Rel, Conflict, lf.Size, "could not read local file: "+err.Error())
 			case sum == rf.MD5:
-				add(lf.Rel, InSync, 0, "")
+				add(lf.Rel, rf.Rel, InSync, 0, "")
 			default:
-				add(lf.Rel, Conflict, lf.Size, "different content")
+				add(lf.Rel, rf.Rel, Conflict, lf.Size, "different content")
 			}
 		}
 	}
 	for _, rf := range remote {
 		if !matched[rf.Rel] {
-			add(rf.Rel, Download, rf.Size, "")
+			add(rf.Rel, rf.Rel, Download, rf.Size, "")
 		}
 	}
 	sort.Slice(p.Items, func(i, j int) bool { return p.Items[i].Rel < p.Items[j].Rel })

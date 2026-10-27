@@ -4,8 +4,9 @@ A personal background service that keeps one folder identical on a dual-boot
 laptop (Windows and Fedora) by syncing it through Google Drive. The files are
 also reachable from a phone through the Google Drive app.
 
-**Status:** Phase 1. Sign-in and a read-only dry run (`cloudsync plan`).
-Nothing is uploaded yet.
+**Status:** Phase 2. Sign-in, dry run, and the one-time first sync on each
+OS. Continuous two-way sync (background service, deletes, shutdown
+handling) is Phase 3.
 
 ## Setup
 
@@ -28,7 +29,24 @@ Nothing is uploaded yet.
 | `cloudsync login` | Opens Google sign-in in the browser; stores the token in Windows Credential Manager or KWallet |
 | `cloudsync whoami` | Shows the signed-in account and Drive storage |
 | `cloudsync plan [--all]` | Dry run: what the first sync would upload, download or flag. Changes nothing |
+| `cloudsync sync [--yes]` | First sync: uploads local-only files, downloads Drive-only files, and keeps both copies of files that differ. Never deletes or overwrites; safe to re-run after an interruption |
 | `cloudsync logout` | Revokes the token with Google and removes it |
+
+### First sync details
+
+- Every transfer is verified against Drive's MD5 checksum. Downloads go to a
+  `.name.cloudsync-partial` file and are moved into place only once verified.
+- Files keep their modified time in both directions.
+- A conflict renames the local file to `name (conflict Windows 2026-10-27 1432).ext`,
+  uploads it, and downloads Drive's version under the original name.
+- What was synced is recorded in `state.db` under `%LocalAppData%\cloudsync`
+  (Windows) or `~/.local/state/cloudsync` (Linux) for the continuous sync.
+
+### Testing against a scratch folder
+
+`CLOUDSYNC_CONFIG` points at a different `config.toml` and
+`CLOUDSYNC_STATE_DIR` at a different state folder, so a test root can be
+synced without touching the real one.
 
 ## What is never synced
 

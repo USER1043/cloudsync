@@ -56,6 +56,14 @@ func TestFirstSync(t *testing.T) {
 			t.Errorf("%s: got %v, want %v", it.Rel, it.Kind, k)
 		}
 	}
+	for _, it := range p.Items {
+		if it.Rel == "Notes.txt" && it.DriveRel != "notes.txt" {
+			t.Errorf("case conflict DriveRel = %q, want notes.txt", it.DriveRel)
+		}
+		if it.Kind == Upload && it.DriveRel != "" {
+			t.Errorf("upload %s has DriveRel %q", it.Rel, it.DriveRel)
+		}
+	}
 	if hashed["resized.png"] || hashed["only-local.pdf"] {
 		t.Error("hashed a file that size alone already decided")
 	}

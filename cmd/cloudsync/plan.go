@@ -22,6 +22,10 @@ import (
 
 const listLimit = 20
 
+func matcher(cfg config.Config) (*filter.Matcher, error) {
+	return filter.New(append(slices.Clone(filter.DefaultIgnore), cfg.Ignore...))
+}
+
 func runPlan(ctx context.Context, args []string) error {
 	fl := flag.NewFlagSet("plan", flag.ContinueOnError)
 	all := fl.Bool("all", false, "list every entry instead of the first 20 per section")
@@ -37,16 +41,12 @@ func runPlan(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	m, err := filter.New(append(slices.Clone(filter.DefaultIgnore), e.cfg.Ignore...))
+	m, err := matcher(e.cfg)
 	if err != nil {
 		return err
 	}
 	w := os.Stdout
-	if e.cfg.Path() == "" {
-		fmt.Fprintln(w, "Config: built-in defaults (copy config.example.toml to customise)")
-	} else {
-		fmt.Fprintln(w, "Config:", e.cfg.Path())
-	}
+	printConfigSource(w, e.cfg)
 
 	d, err := e.drive(ctx)
 	if err != nil {
@@ -58,11 +58,12 @@ func runPlan(ctx context.Context, args []string) error {
 
 	var upload int64
 	for _, root := range e.cfg.Roots {
-		n, err := planRoot(ctx, w, root, m, d, limit)
+		in, err := inspect(ctx, root, m, d)
 		if err != nil {
 			return fmt.Errorf("root %q: %w", root.Name, err)
 		}
-		upload += n
+		printReport(w, in, d != nil, limit)
+		upload += in.uploadBytes()
 	}
 
 	fmt.Fprintln(w)
@@ -79,68 +80,94 @@ func runPlan(ctx context.Context, args []string) error {
 	return nil
 }
 
-// planRoot scans one root, compares it with Drive when d is not nil, and
-// prints the result. It returns the bytes the first sync would upload.
-func planRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matcher, d *gdrive.Client, limit int) (int64, error) {
+func printConfigSource(w io.Writer, cfg config.Config) {
+	if cfg.Path() == "" {
+		fmt.Fprintln(w, "Config: built-in defaults (copy config.example.toml to customise)")
+	} else {
+		fmt.Fprintln(w, "Config:", cfg.Path())
+	}
+}
+
+// inspection is one root's local scan, Drive listing and first-sync plan.
+type inspection struct {
+	root   config.Root
+	local  string
+	rootID string // "" if the Drive folder does not exist yet or Drive was not checked
+	scan   *localfs.Result
+	tree   *gdrive.Tree
+	plan   *plan.Plan
+}
+
+// inspect scans a root and, when d is not nil, lists its Drive folder and
+// works out the first-sync plan. It changes nothing.
+func inspect(ctx context.Context, root config.Root, m *filter.Matcher, d *gdrive.Client) (*inspection, error) {
 	local, err := root.LocalPath()
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	fmt.Fprintf(w, "\n== %s\nLocal: %s\nDrive: My Drive/%s", root.Name, local, strings.Join(root.RemoteSegments(), "/"))
-
-	tree := &gdrive.Tree{}
+	in := &inspection{root: root, local: local, tree: &gdrive.Tree{}}
 	if d != nil {
-		id, err := d.FindFolder(ctx, root.RemoteSegments())
-		if err != nil {
-			return 0, err
+		if in.rootID, err = d.FindFolder(ctx, root.RemoteSegments()); err != nil {
+			return nil, err
 		}
-		if id == "" {
-			fmt.Fprint(w, " (does not exist yet; the first sync creates it)")
-		} else if tree, err = d.ListTree(ctx, id); err != nil {
-			return 0, err
+		if in.rootID != "" {
+			if in.tree, err = d.ListTree(ctx, in.rootID); err != nil {
+				return nil, err
+			}
 		}
+	}
+	if in.scan, err = localfs.Scan(local, m); err != nil {
+		return nil, err
+	}
+	in.plan = plan.FirstSync(in.scan.Files, in.tree.Files, func(rel string) (string, error) {
+		return localfs.MD5File(filepath.Join(local, filepath.FromSlash(rel)))
+	})
+	return in, nil
+}
+
+// uploadBytes is what the first sync would add to Drive: uploads plus the
+// local copies of conflicting files.
+func (in *inspection) uploadBytes() int64 {
+	t := in.plan.Totals()
+	return t[plan.Upload].Bytes + t[plan.Conflict].Bytes
+}
+
+func printReport(w io.Writer, in *inspection, driveChecked bool, limit int) {
+	fmt.Fprintf(w, "\n== %s\nLocal: %s\nDrive: My Drive/%s", in.root.Name, in.local, strings.Join(in.root.RemoteSegments(), "/"))
+	if driveChecked && in.rootID == "" {
+		fmt.Fprint(w, " (does not exist yet; the first sync creates it)")
 	}
 	fmt.Fprintln(w)
 
-	scan, err := localfs.Scan(local, m)
-	if err != nil {
-		return 0, err
-	}
-	p := plan.FirstSync(scan.Files, tree.Files, func(rel string) (string, error) {
-		return localfs.MD5File(filepath.Join(local, filepath.FromSlash(rel)))
-	})
+	printFolders(w, in.scan.Files)
 
-	printFolders(w, scan.Files)
-
-	t := p.Totals()
+	t := in.plan.Totals()
 	fmt.Fprintln(w, "\nFirst sync would:")
 	fmt.Fprintf(w, "  upload     %7d files  %s\n", t[plan.Upload].Count, humanBytes(t[plan.Upload].Bytes))
 	fmt.Fprintf(w, "  download   %7d files  %s\n", t[plan.Download].Count, humanBytes(t[plan.Download].Bytes))
 	fmt.Fprintf(w, "  in sync    %7d files\n", t[plan.InSync].Count)
 	fmt.Fprintf(w, "  conflicts  %7d files  (both copies kept)\n", t[plan.Conflict].Count)
 
-	printLargest(w, p.Of(plan.Upload), 10)
-	printList(w, "Git repos skipped (sync these through GitHub)", scan.Repos, limit)
-	printList(w, "Ignored by rules", scan.Ignored, limit)
+	printLargest(w, in.plan.Of(plan.Upload), 10)
+	printList(w, "Git repos skipped (sync these through GitHub)", in.scan.Repos, limit)
+	printList(w, "Ignored by rules", in.scan.Ignored, limit)
 
 	var issues []string
-	for _, is := range scan.Issues {
+	for _, is := range in.scan.Issues {
 		issues = append(issues, fmt.Sprintf("%s: %s", is.Rel, is.Reason))
 	}
-	for _, is := range tree.Issues {
+	for _, is := range in.tree.Issues {
 		issues = append(issues, fmt.Sprintf("[Drive] %s: %s", is.Rel, is.Reason))
 	}
 	printList(w, "Cannot sync until renamed or fixed", issues, limit)
 
 	var native []string
-	for _, f := range tree.Native {
+	for _, f := range in.tree.Native {
 		native = append(native, f.Rel)
 	}
 	printList(w, "Google Docs/Sheets/Slides in Drive (skipped, no file to download)", native, limit)
-	printList(w, "Conflicts", itemLines(p.Of(plan.Conflict)), limit)
-	printList(w, "Downloads", itemLines(p.Of(plan.Download)), limit)
-
-	return t[plan.Upload].Bytes + t[plan.Conflict].Bytes, nil
+	printList(w, "Conflicts", itemLines(in.plan.Of(plan.Conflict)), limit)
+	printList(w, "Downloads", itemLines(in.plan.Of(plan.Download)), limit)
 }
 
 // printFolders shows how the synced files split across top-level folders.

@@ -27,6 +27,7 @@ type File struct {
 // Result is everything Scan found under a sync root.
 type Result struct {
 	Files   []File
+	Dirs    []string       // folders that are synced, including empty ones
 	Repos   []string       // folders skipped because they are git repositories
 	Ignored []string       // entries skipped by ignore rules; folders end in "/"
 	Issues  []filter.Issue // entries that cannot be synced as they are
@@ -85,6 +86,7 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 				res.Repos = append(res.Repos, rel)
 				return fs.SkipDir
 			}
+			res.Dirs = append(res.Dirs, rel)
 		case d.Type().IsRegular():
 			fi, err := d.Info()
 			if err != nil {

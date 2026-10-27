@@ -50,6 +50,9 @@ func TestScan(t *testing.T) {
 	if !slices.Equal(files, wantFiles) {
 		t.Errorf("files = %v, want %v", files, wantFiles)
 	}
+	if want := []string{"Code", "Code/site", "College", "College/Sem5"}; !slices.Equal(res.Dirs, want) {
+		t.Errorf("dirs = %v, want %v", res.Dirs, want)
+	}
 	if want := []string{"Code/app", "Code/wt"}; !slices.Equal(res.Repos, want) {
 		t.Errorf("repos = %v, want %v", res.Repos, want)
 	}

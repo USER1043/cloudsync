@@ -68,6 +68,21 @@ linux   = "~/College"
 	}
 }
 
+func TestConfigEnvOverride(t *testing.T) {
+	t.Setenv("CLOUDSYNC_CONFIG", filepath.Join(t.TempDir(), "missing.toml"))
+	if _, err := Load(t.TempDir()); err == nil {
+		t.Error("a missing CLOUDSYNC_CONFIG file should be an error, not defaults")
+	}
+}
+
+func TestStateDirOverride(t *testing.T) {
+	want := filepath.Join(t.TempDir(), "state")
+	t.Setenv("CLOUDSYNC_STATE_DIR", want)
+	if got, err := StateDir(); err != nil || got != want {
+		t.Errorf("StateDir = %q, %v; want %q", got, err, want)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	cases := map[string]Config{
 		"no roots":       {},

@@ -23,6 +23,9 @@ Commands:
   whoami    Show the signed-in account and Drive storage
   plan      Dry run: show what the first sync would do (changes nothing)
             --all  list every entry instead of the first 20 per section
+  sync      Run the first sync: upload, download and keep both copies of
+            conflicting files. Never deletes or overwrites. Safe to re-run.
+            --yes  start without asking for confirmation
   version   Print the version
 `
 
@@ -50,6 +53,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runWhoami(ctx)
 	case "plan":
 		return runPlan(ctx, args)
+	case "sync":
+		return runSync(ctx, args)
 	case "version":
 		fmt.Println("cloudsync", version)
 		return nil
