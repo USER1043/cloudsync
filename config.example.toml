@@ -1,0 +1,16 @@
+# CloudSync configuration. Copy this file to:
+#   Windows: %AppData%\cloudsync\config.toml
+#   Linux:   ~/.config/cloudsync/config.toml
+# Without a config.toml, CloudSync uses exactly the root below.
+
+[[root]]
+name    = "MyFiles"
+remote  = "CloudSync/MyFiles"   # folder path under My Drive
+windows = 'C:\MyFiles'
+linux   = "~/My_Files"
+
+# Extra ignore patterns, added to the built-in list. Each pattern matches a
+# single file or folder name, case-insensitively, with * and ? wildcards.
+# A trailing "/" matches folders only. Folders containing .git are always
+# skipped (use GitHub for code).
+# ignore = ["*.iso", "build/", "dist/"]
