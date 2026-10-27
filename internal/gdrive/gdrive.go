@@ -117,19 +117,27 @@ func (c *Client) findChild(ctx context.Context, parentID, name string, folder bo
 		escape(name), parentID, op, folderMime)
 	var r *drive.FileList
 	err := Retry(ctx, func() (err error) {
-		r, err = c.srv.Files.List().Q(q).Spaces("drive").Fields("files(" + fileFields + ")").PageSize(2).Context(ctx).Do()
+		r, err = c.srv.Files.List().Q(q).Spaces("drive").Fields("files(" + fileFields + ")").PageSize(100).Context(ctx).Do()
 		return err
 	})
 	if err != nil {
 		return nil, fmt.Errorf("looking up %q in Drive: %w", name, err)
 	}
+	// Compare names exactly here rather than trust the query to, so "Docs"
+	// and "docs" in one folder stay two folders.
+	var match []*drive.File
+	for _, f := range r.Files {
+		if f.Name == name {
+			match = append(match, f)
+		}
+	}
 	switch {
-	case len(r.Files) == 0:
+	case len(match) == 0:
 		return nil, nil
-	case folder && len(r.Files) > 1:
+	case folder && len(match) > 1:
 		return nil, fmt.Errorf("Drive has more than one folder named %q in the same place; rename one so the path is unambiguous", name)
 	}
-	f := toFile(r.Files[0], name)
+	f := toFile(match[0], name)
 	return &f, nil
 }
 
@@ -242,7 +250,7 @@ type Tree struct {
 	Files   []File         // regular files CloudSync can sync
 	Folders []File         // every subfolder
 	Native  []File         // Google Docs, Sheets, Slides and shortcuts, which have no file to download
-	Issues  []filter.Issue // names that cannot exist on Windows, or that clash by case
+	Issues  []filter.Issue // names that cannot be synced, and exact duplicates
 }
 
 // ListTree lists every non-trashed item under folderID.
@@ -257,20 +265,20 @@ func (c *Client) ListTree(ctx context.Context, folderID string) (*Tree, error) {
 		if err != nil {
 			return nil, fmt.Errorf("listing Drive folder %q: %w", "/"+d.rel, err)
 		}
-		seen := make(map[string]string) // lower-cased name -> name
+		seen := make(map[string]bool)
 		for _, f := range children {
 			rel := joinRel(d.rel, f.Name)
 			if reason := filter.CheckName(f.Name); reason != "" {
 				t.Issues = append(t.Issues, filter.Issue{Rel: rel, Reason: reason})
 				continue
 			}
-			lower := strings.ToLower(f.Name)
-			if other, ok := seen[lower]; ok {
-				t.Issues = append(t.Issues, filter.Issue{Rel: rel,
-					Reason: fmt.Sprintf("same name as %q in this Drive folder (ignoring case)", other)})
+			// Drive allows two items with the same name in one folder; no file
+			// system does. Names that differ only by case are fine.
+			if seen[f.Name] {
+				t.Issues = append(t.Issues, filter.Issue{Rel: rel, Reason: "another item in this Drive folder has exactly the same name"})
 				continue
 			}
-			seen[lower] = f.Name
+			seen[f.Name] = true
 
 			file := toFile(f, rel)
 			switch {

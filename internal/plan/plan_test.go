@@ -45,7 +45,8 @@ func TestFirstSync(t *testing.T) {
 		"same.pptx":       InSync,
 		"edited.docx":     Conflict,
 		"resized.png":     Conflict,
-		"Notes.txt":       Conflict, // case-only match with notes.txt
+		"Notes.txt":       Upload,   // a different file from notes.txt
+		"notes.txt":       Download, // Windows gives one of them a stand-in name
 		"locked.xlsx":     Conflict,
 	}
 	if len(p.Items) != len(want) {
@@ -56,27 +57,19 @@ func TestFirstSync(t *testing.T) {
 			t.Errorf("%s: got %v, want %v", it.Rel, it.Kind, k)
 		}
 	}
-	for _, it := range p.Items {
-		if it.Rel == "Notes.txt" && it.DriveRel != "notes.txt" {
-			t.Errorf("case conflict DriveRel = %q, want notes.txt", it.DriveRel)
-		}
-		if it.Kind == Upload && it.DriveRel != "" {
-			t.Errorf("upload %s has DriveRel %q", it.Rel, it.DriveRel)
-		}
-	}
 	if hashed["resized.png"] || hashed["only-local.pdf"] {
 		t.Error("hashed a file that size alone already decided")
 	}
 
 	tot := p.Totals()
-	if tot[Upload] != (Total{Count: 1, Bytes: 10}) || tot[Download] != (Total{Count: 1, Bytes: 20}) {
+	if tot[Upload] != (Total{Count: 2, Bytes: 13}) || tot[Download] != (Total{Count: 2, Bytes: 23}) {
 		t.Errorf("totals = %+v", tot)
 	}
 	if tot[InSync].Bytes != 0 {
 		t.Error("in-sync files should transfer no bytes")
 	}
-	if got := len(p.Of(Conflict)); got != 4 {
-		t.Errorf("conflicts = %d, want 4", got)
+	if got := len(p.Of(Conflict)); got != 3 {
+		t.Errorf("conflicts = %d, want 3", got)
 	}
 	for i := 1; i < len(p.Items); i++ {
 		if p.Items[i-1].Rel > p.Items[i].Rel {

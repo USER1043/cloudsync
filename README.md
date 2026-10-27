@@ -119,8 +119,12 @@ already in Drive stays there and simply stops syncing.
 - Every transfer is verified against Drive's MD5 checksum. Downloads go to a
   `.name.cloudsync-partial` file and are moved into place only once verified.
   Modified times are kept in both directions.
-- Names that can't exist on both Windows and Linux (`a:b.txt`, `CON`, two
-  names differing only by case) are skipped and listed by `plan`.
+- Names Windows can't store (`a:b.txt`, `notes.`, `CON`, a folder ending in
+  a space, two names differing only by case) keep their real name in Drive
+  and on Linux. On Windows they get a lookalike stand-in (`a：b.txt`,
+  `notes․`, `CON＿`, `folder␣`, `notes (case 2).txt`); CloudSync remembers
+  which is which, so edits and new files map back to the real name. `plan`
+  lists every stand-in.
 
 ## Where things are kept
 

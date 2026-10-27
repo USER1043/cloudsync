@@ -13,7 +13,9 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+// schemaVersion 2 added items.local_name. A CloudSync that knows only
+// version 1 refuses the database rather than ignore the stand-in names.
+const schemaVersion = 2
 
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (
@@ -29,8 +31,14 @@ CREATE TABLE IF NOT EXISTS items (
 	md5         TEXT    NOT NULL,
 	local_mtime INTEGER NOT NULL,
 	synced_at   INTEGER NOT NULL,
+	local_name  TEXT    NOT NULL DEFAULT '',
 	PRIMARY KEY (root, rel)
 );`
+
+// migrations[v] upgrades a database from schema v to v+1.
+var migrations = map[int]string{
+	1: `ALTER TABLE items ADD COLUMN local_name TEXT NOT NULL DEFAULT ''`,
+}
 
 // DB is the state database.
 type DB struct{ db *sql.DB }
@@ -38,7 +46,8 @@ type DB struct{ db *sql.DB }
 // Item is one file or folder as it was when last synced.
 type Item struct {
 	Root       string // root name from the config
-	Rel        string // slash-separated path relative to the root
+	Rel        string // true path: slash-separated, relative to the root, as in Drive
+	LocalName  string // the stand-in name on Windows (package winname); "" if the local name is the true name
 	DriveID    string
 	IsDir      bool
 	Size       int64
@@ -78,6 +87,11 @@ func Open(path string) (*DB, error) {
 	if _, err := db.Exec(schema); err != nil {
 		return fail(err)
 	}
+	for ; v > 0 && v < schemaVersion; v++ {
+		if _, err := db.Exec(migrations[v]); err != nil {
+			return fail(fmt.Errorf("upgrading from schema %d: %w", v, err))
+		}
+	}
 	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
 		return fail(err)
 	}
@@ -94,12 +108,13 @@ func (d *DB) Put(ctx context.Context, it Item) error {
 		isDir = 1
 	}
 	_, err := d.db.ExecContext(ctx, `
-		INSERT INTO items (root, rel, drive_id, is_dir, size, md5, local_mtime, synced_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO items (root, rel, drive_id, is_dir, size, md5, local_mtime, synced_at, local_name)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (root, rel) DO UPDATE SET
 			drive_id = excluded.drive_id, is_dir = excluded.is_dir, size = excluded.size,
-			md5 = excluded.md5, local_mtime = excluded.local_mtime, synced_at = excluded.synced_at`,
-		it.Root, it.Rel, it.DriveID, isDir, it.Size, it.MD5, it.LocalMTime, it.SyncedAt)
+			md5 = excluded.md5, local_mtime = excluded.local_mtime, synced_at = excluded.synced_at,
+			local_name = excluded.local_name`,
+		it.Root, it.Rel, it.DriveID, isDir, it.Size, it.MD5, it.LocalMTime, it.SyncedAt, it.LocalName)
 	if err != nil {
 		return fmt.Errorf("recording %s in the state database: %w", it.Rel, err)
 	}
@@ -111,9 +126,9 @@ func (d *DB) Get(ctx context.Context, root, rel string) (Item, bool, error) {
 	it := Item{Root: root, Rel: rel}
 	var isDir int
 	err := d.db.QueryRowContext(ctx, `
-		SELECT drive_id, is_dir, size, md5, local_mtime, synced_at
+		SELECT drive_id, is_dir, size, md5, local_mtime, synced_at, local_name
 		FROM items WHERE root = ? AND rel = ?`, root, rel).
-		Scan(&it.DriveID, &isDir, &it.Size, &it.MD5, &it.LocalMTime, &it.SyncedAt)
+		Scan(&it.DriveID, &isDir, &it.Size, &it.MD5, &it.LocalMTime, &it.SyncedAt, &it.LocalName)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Item{}, false, nil
 	}
@@ -130,6 +145,25 @@ func (d *DB) Count(ctx context.Context, root string) (files, dirs int, err error
 		SELECT COALESCE(SUM(is_dir = 0), 0), COALESCE(SUM(is_dir = 1), 0)
 		FROM items WHERE root = ?`, root).Scan(&files, &dirs)
 	return files, dirs, err
+}
+
+// StandIns returns the stand-in name of every item of root that has one,
+// keyed by true path, for winname.New.
+func (d *DB) StandIns(ctx context.Context, root string) (map[string]string, error) {
+	rows, err := d.db.QueryContext(ctx, `SELECT rel, local_name FROM items WHERE root = ? AND local_name != ''`, root)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var rel, local string
+		if err := rows.Scan(&rel, &local); err != nil {
+			return nil, err
+		}
+		out[rel] = local
+	}
+	return out, rows.Err()
 }
 
 // Meta returns a stored setting, and false if it is not set.

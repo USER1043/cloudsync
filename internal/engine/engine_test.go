@@ -18,6 +18,7 @@ import (
 	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/plan"
 	"github.com/USER1043/cloudsync/internal/state"
+	"github.com/USER1043/cloudsync/internal/winname"
 )
 
 // fakeDrive is an in-memory Drive.
@@ -138,6 +139,10 @@ type fixture struct {
 	rootID string
 	local  string
 	db     *state.DB
+
+	// windows makes sync act like CloudSync on Windows: names Windows
+	// can't store get stand-ins, loaded from the state DB on each run.
+	windows bool
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -173,18 +178,26 @@ func (fx *fixture) read(rel string) string {
 func (fx *fixture) sync() (*Result, *plan.Plan) {
 	fx.t.Helper()
 	m, _ := filter.New(filter.DefaultIgnore)
-	scan, err := localfs.Scan(fx.local, m)
+	var names *winname.Map
+	if fx.windows {
+		standIns, err := fx.db.StandIns(context.Background(), "MyFiles")
+		if err != nil {
+			fx.t.Fatal(err)
+		}
+		names = winname.New(standIns)
+	}
+	scan, err := localfs.Scan(fx.local, m, names)
 	if err != nil {
 		fx.t.Fatal(err)
 	}
 	tree := fx.drive.tree(fx.rootID)
 	p := plan.FirstSync(scan.Files, tree.Files, func(rel string) (string, error) {
-		return localfs.MD5File(filepath.Join(fx.local, filepath.FromSlash(rel)))
+		return localfs.MD5File(filepath.Join(fx.local, filepath.FromSlash(names.Local(rel))))
 	})
 	var last Progress
 	calls := 0
 	res, err := FirstSync(context.Background(), fx.drive, fx.db,
-		Options{Root: "MyFiles", Local: fx.local, RootID: fx.rootID, Label: "Windows",
+		Options{Root: "MyFiles", Local: fx.local, RootID: fx.rootID, Label: "Windows", Names: names,
 			Progress: func(pr Progress) {
 				if pr.Bytes < last.Bytes || pr.Bytes > pr.TotalBytes {
 					fx.t.Errorf("progress went from %+v to %+v", last, pr)
@@ -296,7 +309,7 @@ func TestDownloadNeverOverwrites(t *testing.T) {
 	fx := newFixture(t)
 	fx.drive.put(t, fx.rootID, "late.txt", "from drive", time.Now())
 	m, _ := filter.New(nil)
-	scan, _ := localfs.Scan(fx.local, m)
+	scan, _ := localfs.Scan(fx.local, m, nil)
 	tree := fx.drive.tree(fx.rootID)
 	p := plan.FirstSync(scan.Files, tree.Files, nil)
 
@@ -319,5 +332,84 @@ func TestConflictName(t *testing.T) {
 	}
 	if got, want := s.conflictName("README"), "README (conflict Linux 2026-10-27 1432)"; got != want {
 		t.Errorf("conflictName = %q, want %q", got, want)
+	}
+}
+
+func TestUploadsNamesWindowsCannotStore(t *testing.T) {
+	// On Linux, such names go to Drive exactly as they are.
+	fx := newFixture(t)
+	fx.write("Hackathon /Paper:1.pdf", "paper")
+	fx.write("Notes.txt", "upper")
+	fx.write("notes.txt", "lower")
+
+	res, _ := fx.sync()
+	if res.Uploaded != 3 || len(res.Failed) != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	want := map[string]string{"Hackathon /Paper:1.pdf": "paper", "Notes.txt": "upper", "notes.txt": "lower"}
+	if got := fx.drive.content(fx.rootID); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("Drive has %v, want %v", got, want)
+	}
+	if standIns, _ := fx.db.StandIns(context.Background(), "MyFiles"); len(standIns) != 0 {
+		t.Errorf("Linux recorded stand-ins: %v", standIns)
+	}
+}
+
+func TestWindowsStandIns(t *testing.T) {
+	fx := newFixture(t)
+	fx.windows = true
+	now := time.Now()
+	fx.drive.put(t, fx.rootID, "Hackathon /Paper:1.pdf", "paper", now)
+	fx.drive.put(t, fx.rootID, "Notes.txt", "upper", now)
+	fx.drive.put(t, fx.rootID, "notes.txt", "lower", now)
+	fx.drive.put(t, fx.rootID, "con.txt", "device", now)
+	fx.drive.put(t, fx.rootID, "report.docx", "theirs", now)
+	fx.write("Real：Name.pdf", "a real full-width colon")
+	fx.write("report.docx", "mine")
+	fx.write("Local/only.txt", "local")
+
+	res, _ := fx.sync()
+	if res.Downloaded != 4 || res.Conflicts != 1 || len(res.Failed) != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	for rel, want := range map[string]string{
+		"Hackathon␣/Paper：1.pdf": "paper",
+		"Notes.txt":              "upper",
+		"notes (case 2).txt":     "lower",
+		"con＿.txt":               "device",
+		"report.docx":            "theirs",
+		"Real：Name.pdf":          "a real full-width colon",
+	} {
+		if got := fx.read(rel); got != want {
+			t.Errorf("local %s = %q, want %q", rel, got, want)
+		}
+	}
+	// The local-only file and the conflict copy reach Drive under true names.
+	drive := fx.drive.content(fx.rootID)
+	if drive["Real：Name.pdf"] != "a real full-width colon" || drive["Local/only.txt"] != "local" || len(drive) != 8 {
+		t.Errorf("Drive has %v", drive)
+	}
+	standIns, _ := fx.db.StandIns(context.Background(), "MyFiles")
+	want := map[string]string{
+		"Hackathon ":             "Hackathon␣",
+		"Hackathon /Paper:1.pdf": "Paper：1.pdf",
+		"notes.txt":              "notes (case 2).txt",
+		"con.txt":                "con＿.txt",
+	}
+	if fmt.Sprint(standIns) != fmt.Sprint(want) {
+		t.Errorf("stand-ins = %q, want %q", standIns, want)
+	}
+
+	// A second run maps every stand-in back to its true name, so nothing is
+	// uploaded twice or downloaded again.
+	res, p := fx.sync()
+	if res.Uploaded != 0 || res.Downloaded != 0 || res.Conflicts != 0 || res.InSync != len(p.Items) {
+		t.Errorf("second run = %+v, plan %+v; want everything in sync", res, p.Items)
+	}
+
+	// A new file inside a stand-in folder goes to the true folder in Drive.
+	fx.write("Hackathon␣/new.txt", "new")
+	if res, _ := fx.sync(); res.Uploaded != 1 || fx.drive.content(fx.rootID)["Hackathon /new.txt"] != "new" {
+		t.Errorf("third run = %+v, Drive has %v", res, fx.drive.content(fx.rootID))
 	}
 }

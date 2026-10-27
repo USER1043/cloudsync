@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/USER1043/cloudsync/internal/filter"
+	"github.com/USER1043/cloudsync/internal/winname"
 )
 
 func write(t *testing.T, root, rel, body string) {
@@ -37,7 +38,7 @@ func TestScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := Scan(root, m)
+	res, err := Scan(root, m, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +80,7 @@ func TestScanIgnoreFilesAndSizeLimit(t *testing.T) {
 
 	m, _ := filter.New(nil)
 	m.SetMaxSize(1000)
-	res, err := Scan(root, m)
+	res, err := Scan(root, m, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +108,7 @@ func TestScanBadIgnoreFile(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, "Sub/"+filter.IgnoreFile, "[unclosed\n")
 	m, _ := filter.New(nil)
-	if _, err := Scan(root, m); err == nil || !strings.Contains(err.Error(), "Sub/.cloudsyncignore line 1") {
+	if _, err := Scan(root, m, nil); err == nil || !strings.Contains(err.Error(), "Sub/.cloudsyncignore line 1") {
 		t.Errorf("err = %v, want it to name the broken rule", err)
 	}
 }
@@ -119,7 +120,7 @@ func TestScanSymlink(t *testing.T) {
 		t.Skipf("cannot create symlinks here: %v", err)
 	}
 	m, _ := filter.New(nil)
-	res, err := Scan(root, m)
+	res, err := Scan(root, m, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,22 +129,64 @@ func TestScanSymlink(t *testing.T) {
 	}
 }
 
-func TestCheckPathCaseCollision(t *testing.T) {
-	names := make(map[string]map[string]string)
-	if r := checkPath(names, "Sem5/Notes.pdf", "Notes.pdf"); r != "" {
-		t.Fatalf("first name flagged: %s", r)
+func TestScanKeepsWindowsOnlyNames(t *testing.T) {
+	// Linux can hold names Windows can't, and names that differ only by
+	// case. They all sync; Windows gives them stand-ins later.
+	root := t.TempDir()
+	for _, rel := range []string{"Hackathon /plan.pdf", "Paper:1.pdf", "Notes.txt", "notes.txt", "con.txt"} {
+		write(t, root, rel, "x")
 	}
-	if r := checkPath(names, "Sem5/notes.pdf", "notes.pdf"); !strings.Contains(r, "letter case") {
-		t.Errorf("case collision not flagged, got %q", r)
+	m, _ := filter.New(nil)
+	res, err := Scan(root, m, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if r := checkPath(names, "Sem6/notes.pdf", "notes.pdf"); r != "" {
-		t.Errorf("same name in another folder flagged: %s", r)
+	var rels []string
+	for _, f := range res.Files {
+		rels = append(rels, f.Rel)
+	}
+	slices.Sort(rels)
+	if want := []string{"Hackathon /plan.pdf", "Notes.txt", "Paper:1.pdf", "con.txt", "notes.txt"}; !slices.Equal(rels, want) || len(res.Issues) != 0 {
+		t.Errorf("files = %q, issues = %v; want %q and no issues", rels, res.Issues, want)
+	}
+}
+
+func TestScanTranslatesStandIns(t *testing.T) {
+	// On Windows, stand-ins on disk come back as their true names, while a
+	// file really named with a full-width character keeps its name.
+	root := t.TempDir()
+	write(t, root, "Hackathon␣/Paper：1.pdf", "x")
+	write(t, root, "Hackathon␣/Real：Name.pdf", "x")
+	write(t, root, "Hackathon␣/skip.iso", "x")
+	names := winname.New(map[string]string{
+		"Hackathon ":             "Hackathon␣",
+		"Hackathon /Paper:1.pdf": "Paper：1.pdf",
+	})
+	m, _ := filter.New([]string{"/Hackathon /*.iso"}) // rules use true paths
+	res, err := Scan(root, m, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rels []string
+	for _, f := range res.Files {
+		rels = append(rels, f.Rel)
+	}
+	slices.Sort(rels)
+	if want := []string{"Hackathon /Paper:1.pdf", "Hackathon /Real：Name.pdf"}; !slices.Equal(rels, want) {
+		t.Errorf("files = %q, want %q", rels, want)
+	}
+	if !slices.Equal(res.Dirs, []string{"Hackathon "}) || !slices.Equal(res.Ignored, []string{"Hackathon /skip.iso"}) {
+		t.Errorf("dirs = %q, ignored = %q", res.Dirs, res.Ignored)
+	}
+	// The scan told the map which local names are taken.
+	if got := names.Assign("Hackathon /real：name.pdf"); got != "Hackathon␣/real：name (case 2).pdf" {
+		t.Errorf("Assign after scan = %q", got)
 	}
 }
 
 func TestScanMissingRoot(t *testing.T) {
 	m, _ := filter.New(nil)
-	if _, err := Scan(filepath.Join(t.TempDir(), "nope"), m); err == nil {
+	if _, err := Scan(filepath.Join(t.TempDir(), "nope"), m, nil); err == nil {
 		t.Error("expected an error for a missing root")
 	}
 }

@@ -83,7 +83,11 @@ func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matc
 		return nil
 	}
 
-	in, err := inspect(ctx, root, m, d)
+	names, err := loadNames(ctx, db, root.Name)
+	if err != nil {
+		return err
+	}
+	in, err := inspect(ctx, root, m, d, names)
 	if err != nil {
 		return err
 	}
@@ -115,7 +119,7 @@ func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matc
 
 	start := time.Now()
 	fmt.Fprintln(w)
-	opt := engine.Options{Root: root.Name, Local: in.local, RootID: rootID, Label: osLabel(), Log: w}
+	opt := engine.Options{Root: root.Name, Local: in.local, RootID: rootID, Label: osLabel(), Log: w, Names: names}
 	if f, ok := w.(*os.File); ok {
 		if bar := newProgressBar(f); bar != nil {
 			opt.Log, opt.Progress = bar, bar.Update

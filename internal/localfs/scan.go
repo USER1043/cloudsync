@@ -11,16 +11,16 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"strings"
 	"time"
 	"unicode/utf16"
 
 	"github.com/USER1043/cloudsync/internal/filter"
+	"github.com/USER1043/cloudsync/internal/winname"
 )
 
 // File is a regular file that CloudSync would sync.
 type File struct {
-	Rel     string // slash-separated path relative to the sync root
+	Rel     string // true path: slash-separated, relative to the sync root, as in Drive
 	Size    int64
 	ModTime time.Time
 }
@@ -46,7 +46,11 @@ const maxRelPath = 240
 // Scan walks root and sorts every entry into synced files, skipped git
 // repositories, ignored entries and issues. Besides m's rules it applies any
 // .cloudsyncignore files it finds. It reads metadata and ignore files only.
-func Scan(root string, m *filter.Matcher) (*Result, error) {
+//
+// Every path in the Result is a true path. On Windows, names (a Map of
+// stand-ins) turns stand-in names on disk back into true names and learns
+// which local names are taken; on Linux it is nil.
+func Scan(root string, m *filter.Matcher, names *winname.Map) (*Result, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		return nil, fmt.Errorf("sync root: %w", err)
@@ -60,12 +64,15 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 		return nil, err
 	}
 	res := &Result{Matcher: m}
-	names := make(map[string]map[string]string) // parent rel -> lower-cased name -> name
+	trueDirs := map[string]string{".": ""} // local path of each folder -> its true path
 	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if p == root {
 			return err
 		}
-		rel := relPath(root, p)
+		localRel := relPath(root, p)
+		dir := trueDirs[path.Dir(localRel)]
+		name := names.Found(dir, filepath.Base(p))
+		rel := joinRel(dir, name)
 		if err != nil {
 			res.Issues = append(res.Issues, filter.Issue{Rel: rel, Reason: err.Error()})
 			if d != nil && d.IsDir() {
@@ -74,7 +81,7 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 			return nil
 		}
 
-		name, isDir := d.Name(), d.IsDir()
+		isDir := d.IsDir()
 		if m.Match(rel, isDir) {
 			if isDir {
 				res.Ignored = append(res.Ignored, rel+"/")
@@ -83,7 +90,7 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 			res.Ignored = append(res.Ignored, rel)
 			return nil
 		}
-		if reason := checkPath(names, rel, name); reason != "" {
+		if reason := checkPath(rel, name); reason != "" {
 			res.Issues = append(res.Issues, filter.Issue{Rel: rel, Reason: reason})
 			if isDir {
 				return fs.SkipDir
@@ -98,6 +105,7 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 				return fs.SkipDir
 			}
 			res.Dirs = append(res.Dirs, rel)
+			trueDirs[localRel] = rel
 			// Rules in this folder's .cloudsyncignore apply to everything below it,
 			// which WalkDir visits next.
 			return loadIgnoreFile(m, p, rel)
@@ -126,23 +134,14 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 	return res, nil
 }
 
-// checkPath returns why rel cannot be synced, or "". It also records name
-// so a later sibling that differs only by case is caught.
-func checkPath(names map[string]map[string]string, rel, name string) string {
+// checkPath returns why rel, whose last name is name, cannot be synced, or "".
+func checkPath(rel, name string) string {
 	if reason := filter.CheckName(name); reason != "" {
 		return reason
 	}
 	if n := len(utf16.Encode([]rune(rel))); n > maxRelPath {
 		return fmt.Sprintf("path is %d characters long; it must stay under %d for Windows", n, maxRelPath)
 	}
-	parent, lower := path.Dir(rel), strings.ToLower(name)
-	if names[parent] == nil {
-		names[parent] = make(map[string]string)
-	}
-	if other, ok := names[parent][lower]; ok {
-		return fmt.Sprintf("differs from %q only by letter case; Windows cannot hold both", other)
-	}
-	names[parent][lower] = name
 	return ""
 }
 
@@ -165,6 +164,13 @@ func loadIgnoreFile(m *filter.Matcher, dir, rel string) error {
 func isRepo(dir string) bool {
 	_, err := os.Lstat(filepath.Join(dir, ".git"))
 	return err == nil
+}
+
+func joinRel(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
 }
 
 func relPath(root, p string) string {

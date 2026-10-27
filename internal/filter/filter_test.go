@@ -6,16 +6,17 @@ import (
 )
 
 func TestCheckName(t *testing.T) {
-	ok := []string{"notes.pdf", "Sem 5", ".bashrc", "con-notes.txt", "a.b.c", "résumé.docx"}
+	// Names Windows rejects are fine here: Windows gets a stand-in for them.
+	ok := []string{"notes.pdf", "Sem 5", ".bashrc", "a:b", "what?.txt", `back\slash`, "trailing ", "CON", "tab\tname", "résumé.docx"}
 	for _, n := range ok {
 		if r := CheckName(n); r != "" {
-			t.Errorf("CheckName(%q) = %q, want portable", n, r)
+			t.Errorf("CheckName(%q) = %q, want syncable", n, r)
 		}
 	}
-	bad := []string{"", "a:b", "what?.txt", "x*y", `back\slash`, "slash/name", "trailing.", "trailing ", "CON", "con.txt", "Lpt1.log", "nul ", "tab\tname"}
+	bad := []string{"", ".", "..", "slash/name", "nul\x00byte", "latin1 \xe9t\xe9"}
 	for _, n := range bad {
 		if CheckName(n) == "" {
-			t.Errorf("CheckName(%q) = portable, want a reason", n)
+			t.Errorf("CheckName(%q) = syncable, want a reason", n)
 		}
 	}
 }

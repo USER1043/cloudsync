@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/plan"
 	"github.com/USER1043/cloudsync/internal/state"
+	"github.com/USER1043/cloudsync/internal/winname"
 )
 
 // Remote is the part of Google Drive the engine uses. *gdrive.Client
@@ -40,6 +42,11 @@ type Options struct {
 	Label   string    // OS name used in conflict copy names, e.g. "Windows"
 	Workers int       // parallel transfers; 4 if zero
 	Log     io.Writer // one line per folder created and per transfer
+
+	// Names holds the stand-in names this computer uses (Windows only; nil
+	// on Linux). It must be the Map the scan was made with. Plans and the
+	// state DB use true paths; Names turns them into local ones.
+	Names *winname.Map
 
 	// Progress, if set, is called when transfers start, as bytes move (at
 	// most every 200ms) and after each transfer finishes. Calls never overlap.
@@ -80,6 +87,7 @@ func FirstSync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *l
 		local:    make(map[string]localfs.File, len(scan.Files)),
 		remote:   make(map[string]gdrive.File, len(tree.Files)),
 		folders:  map[string]string{"": opt.RootID},
+		copies:   make(map[string]string),
 		inflight: make(map[string]int64),
 	}
 	for _, f := range scan.Files {
@@ -96,13 +104,21 @@ func FirstSync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *l
 		return &s.res, err
 	}
 
+	// Choose every new local name before the transfers run in parallel, so
+	// the choice doesn't depend on which transfer happens to go first.
 	var jobs []plan.Item
 	for _, it := range p.Items {
-		if it.Kind == plan.InSync {
+		switch it.Kind {
+		case plan.InSync:
 			if err := s.recordInSync(it); err != nil {
 				return &s.res, err
 			}
 			continue
+		case plan.Download:
+			opt.Names.Assign(it.Rel)
+		case plan.Conflict:
+			s.copies[it.Rel] = s.conflictName(it.Rel)
+			opt.Names.Assign(s.copies[it.Rel])
 		}
 		jobs = append(jobs, it)
 		s.totalBytes += it.Size
@@ -144,6 +160,7 @@ type run struct {
 	local   map[string]localfs.File
 	remote  map[string]gdrive.File
 	folders map[string]string // rel -> Drive folder ID; "" is the root. Read-only once transfers start.
+	copies  map[string]string // conflict rel -> rel of the local version's copy. Read-only once transfers start.
 
 	mu         sync.Mutex // guards res, the progress counters and writes to opt.Log
 	res        Result
@@ -219,7 +236,10 @@ func (s *run) makeFolders(scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan)
 		fmt.Fprintf(s.opt.Log, "folder    %s\n", rel)
 	}
 
-	for _, f := range tree.Folders {
+	local := slices.Clone(tree.Folders)
+	slices.SortFunc(local, func(a, b gdrive.File) int { return strings.Compare(a.Rel, b.Rel) }) // parents first
+	for _, f := range local {
+		s.opt.Names.Assign(f.Rel)
 		if err := os.MkdirAll(s.abs(f.Rel), 0o755); err != nil {
 			return err
 		}
@@ -228,17 +248,24 @@ func (s *run) makeFolders(scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan)
 		if rel == "" {
 			continue
 		}
-		if err := s.db.Put(s.ctx, state.Item{Root: s.opt.Root, Rel: rel, DriveID: id, IsDir: true, SyncedAt: s.now.Unix()}); err != nil {
+		if err := s.record(state.Item{Root: s.opt.Root, Rel: rel, DriveID: id, IsDir: true, SyncedAt: s.now.Unix()}); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// record saves an item in the state DB along with its stand-in name, if it
+// has one.
+func (s *run) record(it state.Item) error {
+	it.LocalName = s.opt.Names.StandIn(it.Rel)
+	return s.db.Put(s.ctx, it)
+}
+
 func (s *run) recordInSync(it plan.Item) error {
-	lf, rf := s.local[it.Rel], s.remote[it.DriveRel]
+	lf, rf := s.local[it.Rel], s.remote[it.Rel]
 	s.res.InSync++
-	return s.db.Put(s.ctx, state.Item{
+	return s.record(state.Item{
 		Root: s.opt.Root, Rel: it.Rel, DriveID: rf.ID, Size: lf.Size, MD5: rf.MD5,
 		LocalMTime: lf.ModTime.UnixNano(), SyncedAt: s.now.Unix(),
 	})
@@ -257,7 +284,7 @@ func (s *run) do(it plan.Item) {
 		n, err = s.upload(it.Rel, track)
 	case plan.Download:
 		verb = "download"
-		n, err = s.download(it.DriveRel, track)
+		n, err = s.download(it.Rel, track)
 	case plan.Conflict:
 		verb = "conflict"
 		n, err = s.conflict(it, track)
@@ -313,7 +340,7 @@ func (s *run) upload(rel string, track func(int64)) (int64, error) {
 	if after.Size() != before.Size() || !after.ModTime().Equal(before.ModTime()) {
 		return 0, errors.New("the file changed while uploading; run sync again")
 	}
-	return before.Size(), s.db.Put(s.ctx, state.Item{
+	return before.Size(), s.record(state.Item{
 		Root: s.opt.Root, Rel: rel, DriveID: f.ID, Size: before.Size(), MD5: sum,
 		LocalMTime: before.ModTime().UnixNano(), SyncedAt: time.Now().Unix(),
 	})
@@ -355,7 +382,7 @@ func (s *run) download(rel string, track func(int64)) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return rf.Size, s.db.Put(s.ctx, state.Item{
+	return rf.Size, s.record(state.Item{
 		Root: s.opt.Root, Rel: rel, DriveID: rf.ID, Size: fi.Size(), MD5: rf.MD5,
 		LocalMTime: fi.ModTime().UnixNano(), SyncedAt: time.Now().Unix(),
 	})
@@ -398,11 +425,11 @@ func (c *counter) Write(p []byte) (int, error) {
 // conflict keeps both versions: the local file is renamed to a conflict copy
 // and uploaded, and Drive's version is downloaded under the original name.
 func (s *run) conflict(it plan.Item, track func(int64)) (int64, error) {
-	copyRel := s.conflictName(it.Rel)
+	copyRel := s.copies[it.Rel]
 	if err := os.Rename(s.abs(it.Rel), s.abs(copyRel)); err != nil {
 		return 0, err
 	}
-	down, err := s.download(it.DriveRel, track)
+	down, err := s.download(it.Rel, track)
 	if err != nil {
 		return 0, fmt.Errorf("your version was kept as %s, but downloading Drive's version failed: %w", copyRel, err)
 	}
@@ -420,7 +447,7 @@ func (s *run) conflictName(rel string) string {
 	base := fmt.Sprintf("%s (conflict %s %s)", strings.TrimSuffix(file, ext), s.opt.Label, s.now.Format("2006-01-02 1504"))
 	name := base + ext
 	for i := 2; ; i++ {
-		_, localErr := os.Lstat(s.abs(dir + name))
+		_, localErr := os.Lstat(s.guess(dir + name))
 		_, inDrive := s.remote[dir+name]
 		if errors.Is(localErr, fs.ErrNotExist) && !inDrive {
 			return dir + name
@@ -429,8 +456,20 @@ func (s *run) conflictName(rel string) string {
 	}
 }
 
+// abs returns the local path of the true path rel. A new name must have been
+// assigned in opt.Names first.
 func (s *run) abs(rel string) string {
-	return filepath.Join(s.opt.Local, filepath.FromSlash(rel))
+	return filepath.Join(s.opt.Local, filepath.FromSlash(s.opt.Names.Local(rel)))
+}
+
+// guess returns where rel would be stored locally if its name were
+// assigned now, for checking whether a name is free without assigning it.
+func (s *run) guess(rel string) string {
+	if s.opt.Names == nil {
+		return s.abs(rel)
+	}
+	dir, name := splitRel(rel)
+	return filepath.Join(s.opt.Local, filepath.FromSlash(s.opt.Names.Local(dir)), winname.Encode(name))
 }
 
 func splitRel(rel string) (parent, name string) {

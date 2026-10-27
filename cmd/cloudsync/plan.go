@@ -3,11 +3,14 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -16,6 +19,8 @@ import (
 	"github.com/USER1043/cloudsync/internal/gdrive"
 	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/plan"
+	"github.com/USER1043/cloudsync/internal/state"
+	"github.com/USER1043/cloudsync/internal/winname"
 )
 
 const listLimit = 20
@@ -65,8 +70,19 @@ func runPlan(ctx context.Context, args []string) error {
 	}
 
 	var upload int64
+	db, err := peekState()
+	if err != nil {
+		return err
+	}
+	if db != nil {
+		defer db.Close()
+	}
 	for _, root := range e.cfg.Roots {
-		in, err := inspect(ctx, root, m, d)
+		names, err := loadNames(ctx, db, root.Name)
+		if err != nil {
+			return err
+		}
+		in, err := inspect(ctx, root, m, d, names)
 		if err != nil {
 			return fmt.Errorf("root %q: %w", root.Name, err)
 		}
@@ -92,11 +108,46 @@ func printConfigSource(w io.Writer, cfg config.Config) {
 	fmt.Fprintln(w, "Config:", cfg.Path())
 }
 
+// loadNames returns the stand-in names root uses on this computer: a Map
+// loaded from db on Windows (empty if db is nil), and nil on other systems,
+// which store every name as it is.
+func loadNames(ctx context.Context, db *state.DB, root string) (*winname.Map, error) {
+	if runtime.GOOS != "windows" {
+		return nil, nil
+	}
+	if db == nil {
+		return winname.New(nil), nil
+	}
+	standIns, err := db.StandIns(ctx, root)
+	if err != nil {
+		return nil, err
+	}
+	return winname.New(standIns), nil
+}
+
+// peekState opens the state database without the sync lock, for reading
+// stand-in names, or returns nil if there is none yet.
+func peekState() (*state.DB, error) {
+	if runtime.GOOS != "windows" {
+		return nil, nil
+	}
+	dir, err := config.StateDir()
+	if err != nil {
+		return nil, err
+	}
+	p := filepath.Join(dir, "state.db")
+	if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	return state.Open(p)
+}
+
 // inspection is one root's local scan, Drive listing and first-sync plan.
 type inspection struct {
 	root         config.Root
 	local        string
-	rootID       string // "" if the Drive folder does not exist yet or Drive was not checked
+	names        *winname.Map // stand-in names on Windows; nil elsewhere
+	rootID       string       // "" if the Drive folder does not exist yet or Drive was not checked
 	scan         *localfs.Result
 	tree         *gdrive.Tree // Drive listing with ignored items removed
 	driveIgnored []string     // Drive paths the ignore rules and size limit left out
@@ -105,12 +156,12 @@ type inspection struct {
 
 // inspect scans a root and, when d is not nil, lists its Drive folder and
 // works out the first-sync plan. It changes nothing.
-func inspect(ctx context.Context, root config.Root, m *filter.Matcher, d *gdrive.Client) (*inspection, error) {
+func inspect(ctx context.Context, root config.Root, m *filter.Matcher, d *gdrive.Client, names *winname.Map) (*inspection, error) {
 	local, err := root.LocalPath()
 	if err != nil {
 		return nil, err
 	}
-	in := &inspection{root: root, local: local, tree: &gdrive.Tree{}}
+	in := &inspection{root: root, local: local, names: names, tree: &gdrive.Tree{}}
 	if d != nil {
 		if in.rootID, err = d.FindFolder(ctx, root.RemoteSegments()); err != nil {
 			return nil, err
@@ -121,14 +172,14 @@ func inspect(ctx context.Context, root config.Root, m *filter.Matcher, d *gdrive
 			}
 		}
 	}
-	if in.scan, err = localfs.Scan(local, m); err != nil {
+	if in.scan, err = localfs.Scan(local, m, names); err != nil {
 		return nil, err
 	}
 	// The scan's matcher includes the local .cloudsyncignore files, so Drive
 	// gets the same rules.
 	in.tree, in.driveIgnored = in.tree.Filter(in.scan.Matcher)
 	in.plan = plan.FirstSync(in.scan.Files, in.tree.Files, func(rel string) (string, error) {
-		return localfs.MD5File(filepath.Join(local, filepath.FromSlash(rel)))
+		return localfs.MD5File(filepath.Join(local, filepath.FromSlash(names.Local(rel))))
 	})
 	return in, nil
 }
@@ -174,6 +225,11 @@ func printReport(w io.Writer, in *inspection, driveChecked bool, limit int) {
 		issues = append(issues, fmt.Sprintf("[Drive] %s: %s", is.Rel, is.Reason))
 	}
 	printList(w, "Cannot sync until renamed or fixed", issues, limit)
+	if in.names != nil {
+		printList(w, "Stand-in names on this computer (true name in Drive -> name here)", in.standIns(), limit)
+	} else {
+		printList(w, "Shown with a stand-in name on Windows (true name -> name on Windows)", in.standIns(), limit)
+	}
 
 	var native []string
 	for _, f := range in.tree.Native {
@@ -182,6 +238,38 @@ func printReport(w io.Writer, in *inspection, driveChecked bool, limit int) {
 	printList(w, "Google Docs/Sheets/Slides in Drive (skipped, no file to download)", native, limit)
 	printList(w, "Conflicts", itemLines(in.plan.Of(plan.Conflict)), limit)
 	printList(w, "Downloads", itemLines(in.plan.Of(plan.Download)), limit)
+}
+
+// standIns lists every synced entry whose name Windows stores as a stand-in.
+// On Windows they are the names this sync uses; elsewhere, the names a
+// Windows computer syncing with an empty folder would use.
+func (in *inspection) standIns() []string {
+	names := in.names.Clone()
+	if names == nil {
+		names = winname.New(nil)
+	}
+	var dirs, files []string
+	dirs = append(dirs, in.scan.Dirs...)
+	for _, f := range in.tree.Folders {
+		dirs = append(dirs, f.Rel)
+	}
+	for _, f := range in.scan.Files {
+		files = append(files, f.Rel)
+	}
+	for _, f := range in.tree.Files {
+		files = append(files, f.Rel)
+	}
+	// Folders first and in order, so parents are assigned before children.
+	slices.Sort(dirs)
+	slices.Sort(files)
+	var lines []string
+	for _, rel := range slices.Concat(slices.Compact(dirs), slices.Compact(files)) {
+		names.Assign(rel)
+		if s := names.StandIn(rel); s != "" {
+			lines = append(lines, fmt.Sprintf("%q -> %q", rel, s))
+		}
+	}
+	return lines
 }
 
 // printFolders shows how the synced files split across top-level folders.

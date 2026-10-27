@@ -1,5 +1,5 @@
 // Package filter decides which paths CloudSync skips and flags names that
-// cannot exist on both Windows and Linux.
+// cannot be synced at all.
 package filter
 
 import (
@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode/utf8"
 )
 
 // Issue is an entry that cannot be synced as it is.
@@ -197,35 +198,17 @@ func globToRegexp(p string) (string, error) {
 	return b.String(), nil
 }
 
-var reservedNames = func() map[string]bool {
-	m := map[string]bool{"con": true, "prn": true, "aux": true, "nul": true}
-	for i := 1; i <= 9; i++ {
-		m[fmt.Sprintf("com%d", i)] = true
-		m[fmt.Sprintf("lpt%d", i)] = true
-	}
-	return m
-}()
-
-// CheckName returns why a file or folder name cannot exist on both Windows
-// and Linux, or "" if it is portable.
+// CheckName returns why a file or folder name cannot be synced anywhere, or
+// "" if it can. Names that only Windows rejects are fine: Windows stores them
+// under a stand-in (package winname).
 func CheckName(name string) string {
-	if name == "" {
-		return "empty name"
-	}
-	for _, r := range name {
-		if r < 0x20 {
-			return "contains a control character"
-		}
-		if strings.ContainsRune(`<>:"/\|?*`, r) {
-			return fmt.Sprintf("contains %q, which Windows does not allow", r)
-		}
-	}
-	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
-		return "ends with a dot or space, which Windows does not allow"
-	}
-	base, _, _ := strings.Cut(name, ".")
-	if reservedNames[strings.ToLower(strings.TrimRight(base, " "))] {
-		return "is a reserved device name on Windows"
+	switch {
+	case name == "", name == ".", name == "..":
+		return fmt.Sprintf("%q is not a usable file name", name)
+	case strings.ContainsAny(name, "/\x00"):
+		return "contains '/', which no file system allows in a name"
+	case !utf8.ValidString(name):
+		return "is not valid UTF-8, which Drive requires"
 	}
 	return ""
 }
