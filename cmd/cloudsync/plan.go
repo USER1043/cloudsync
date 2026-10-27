@@ -3,7 +3,6 @@ package main
 import (
 	"cmp"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/USER1043/cloudsync/internal/auth"
 	"github.com/USER1043/cloudsync/internal/config"
 	"github.com/USER1043/cloudsync/internal/filter"
 	"github.com/USER1043/cloudsync/internal/gdrive"
@@ -22,8 +20,18 @@ import (
 
 const listLimit = 20
 
+// matcher combines the built-in ignore rules with the config's rules and
+// size limit. .cloudsyncignore files are added during the scan.
 func matcher(cfg config.Config) (*filter.Matcher, error) {
-	return filter.New(append(slices.Clone(filter.DefaultIgnore), cfg.Ignore...))
+	m, err := filter.New(filter.DefaultIgnore)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.AddRules("", cfg.Ignore, "ignore rule"); err != nil {
+		return nil, fmt.Errorf("%s: %w", cfg.Path(), err)
+	}
+	m.SetMaxSize(cfg.MaxBytes())
+	return m, nil
 }
 
 func runPlan(ctx context.Context, args []string) error {
@@ -50,7 +58,7 @@ func runPlan(ctx context.Context, args []string) error {
 
 	d, err := e.drive(ctx)
 	if err != nil {
-		if !errors.Is(err, auth.ErrNotLoggedIn) && !errors.Is(err, auth.ErrNoClientConfig) {
+		if !signInMissing(err) {
 			return err
 		}
 		fmt.Fprintf(w, "Drive: not checked (%v)\nEvery local file counts as an upload.\n", err)
@@ -81,21 +89,18 @@ func runPlan(ctx context.Context, args []string) error {
 }
 
 func printConfigSource(w io.Writer, cfg config.Config) {
-	if cfg.Path() == "" {
-		fmt.Fprintln(w, "Config: built-in defaults (copy config.example.toml to customise)")
-	} else {
-		fmt.Fprintln(w, "Config:", cfg.Path())
-	}
+	fmt.Fprintln(w, "Config:", cfg.Path())
 }
 
 // inspection is one root's local scan, Drive listing and first-sync plan.
 type inspection struct {
-	root   config.Root
-	local  string
-	rootID string // "" if the Drive folder does not exist yet or Drive was not checked
-	scan   *localfs.Result
-	tree   *gdrive.Tree
-	plan   *plan.Plan
+	root         config.Root
+	local        string
+	rootID       string // "" if the Drive folder does not exist yet or Drive was not checked
+	scan         *localfs.Result
+	tree         *gdrive.Tree // Drive listing with ignored items removed
+	driveIgnored []string     // Drive paths the ignore rules and size limit left out
+	plan         *plan.Plan
 }
 
 // inspect scans a root and, when d is not nil, lists its Drive folder and
@@ -119,6 +124,9 @@ func inspect(ctx context.Context, root config.Root, m *filter.Matcher, d *gdrive
 	if in.scan, err = localfs.Scan(local, m); err != nil {
 		return nil, err
 	}
+	// The scan's matcher includes the local .cloudsyncignore files, so Drive
+	// gets the same rules.
+	in.tree, in.driveIgnored = in.tree.Filter(in.scan.Matcher)
 	in.plan = plan.FirstSync(in.scan.Files, in.tree.Files, func(rel string) (string, error) {
 		return localfs.MD5File(filepath.Join(local, filepath.FromSlash(rel)))
 	})
@@ -151,6 +159,12 @@ func printReport(w io.Writer, in *inspection, driveChecked bool, limit int) {
 	printLargest(w, in.plan.Of(plan.Upload), 10)
 	printList(w, "Git repos skipped (sync these through GitHub)", in.scan.Repos, limit)
 	printList(w, "Ignored by rules", in.scan.Ignored, limit)
+	var large []string
+	for _, f := range in.scan.TooLarge {
+		large = append(large, fmt.Sprintf("%s (%s)", f.Rel, humanBytes(f.Size)))
+	}
+	printList(w, "Over max_file_size", large, limit)
+	printList(w, "Ignored in Drive (not downloaded)", in.driveIgnored, limit)
 
 	var issues []string
 	for _, is := range in.scan.Issues {

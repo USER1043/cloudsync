@@ -1,16 +1,22 @@
-# CloudSync configuration. Copy this file to:
+# Example CloudSync configuration. `cloudsync init` writes this file for you:
 #   Windows: %AppData%\cloudsync\config.toml
 #   Linux:   ~/.config/cloudsync/config.toml
-# Without a config.toml, CloudSync uses exactly the root below.
+# Every computer keeps its own copy, pointing at the same Drive folder.
+
+# Extra rules for what to skip, written like .gitignore (see README).
+ignore = [
+  "*.iso",              # a file type, anywhere
+  "/College/Old/",      # one folder, as a path from the synced folder
+  "!keep-this.iso",     # exception to an earlier rule
+]
+
+# Skip files larger than this (KB, MB or GB). Leave out for no limit.
+max_file_size = "500MB"
 
 [[root]]
-name    = "MyFiles"
-remote  = "CloudSync/MyFiles"   # folder path under My Drive
-windows = 'C:\MyFiles'
-linux   = "~/My_Files"
+name   = "Documents"            # key in CloudSync's sync records; do not change later
+remote = "CloudSync/Documents"  # folder in My Drive
+path   = "~/Documents/Synced"   # folder on this computer (~ is your home folder)
 
-# Extra ignore patterns, added to the built-in list. Each pattern matches a
-# single file or folder name, case-insensitively, with * and ? wildcards.
-# A trailing "/" matches folders only. Folders containing .git are always
-# skipped (use GitHub for code).
-# ignore = ["*.iso", "build/", "dist/"]
+# More folders can be synced by adding more [[root]] sections, each with its
+# own name and Drive folder.

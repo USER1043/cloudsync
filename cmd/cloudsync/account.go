@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,12 +13,13 @@ import (
 	"github.com/USER1043/cloudsync/internal/gdrive"
 )
 
-// env is what every command needs: the config directory and the config.
+// env is what the sync commands need: the config directory and the config.
 type env struct {
 	dir string
 	cfg config.Config
 }
 
+// loadEnv loads the config, which must exist (see `cloudsync init`).
 func loadEnv() (*env, error) {
 	dir, err := config.Dir()
 	if err != nil {
@@ -30,10 +32,12 @@ func loadEnv() (*env, error) {
 	return &env{dir: dir, cfg: cfg}, nil
 }
 
-// drive returns a Drive client using the stored token. It fails with
+func (e *env) drive(ctx context.Context) (*gdrive.Client, error) { return driveClient(ctx, e.dir) }
+
+// driveClient returns a Drive client using the stored token. It fails with
 // auth.ErrNoClientConfig or auth.ErrNotLoggedIn until sign-in is set up.
-func (e *env) drive(ctx context.Context) (*gdrive.Client, error) {
-	oc, err := auth.LoadConfig(e.dir)
+func driveClient(ctx context.Context, dir string) (*gdrive.Client, error) {
+	oc, err := auth.LoadConfig(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -44,12 +48,17 @@ func (e *env) drive(ctx context.Context) (*gdrive.Client, error) {
 	return gdrive.New(ctx, hc)
 }
 
+// signInMissing reports whether err just means sign-in is not set up yet.
+func signInMissing(err error) bool {
+	return errors.Is(err, auth.ErrNotLoggedIn) || errors.Is(err, auth.ErrNoClientConfig)
+}
+
 func runLogin(ctx context.Context) error {
-	e, err := loadEnv()
+	dir, err := config.Dir()
 	if err != nil {
 		return err
 	}
-	oc, err := auth.LoadConfig(e.dir)
+	oc, err := auth.LoadConfig(dir)
 	if err != nil {
 		return err
 	}
@@ -61,7 +70,13 @@ func runLogin(ctx context.Context) error {
 		return err
 	}
 	fmt.Println("Signed in. The token is saved in the system credential store.")
-	return runWhoami(ctx)
+	if err := runWhoami(ctx); err != nil {
+		return err
+	}
+	if _, err := config.Load(dir); errors.Is(err, config.ErrNoConfig) {
+		fmt.Println("\nNext: run `cloudsync init` to choose the folder to sync.")
+	}
+	return nil
 }
 
 func runLogout(ctx context.Context) error {
@@ -73,11 +88,11 @@ func runLogout(ctx context.Context) error {
 }
 
 func runWhoami(ctx context.Context) error {
-	e, err := loadEnv()
+	dir, err := config.Dir()
 	if err != nil {
 		return err
 	}
-	d, err := e.drive(ctx)
+	d, err := driveClient(ctx, dir)
 	if err != nil {
 		return err
 	}

@@ -21,6 +21,8 @@ Commands:
   login     Sign in to Google in your browser and store the token securely
   logout    Revoke and remove the stored Google token
   whoami    Show the signed-in account and Drive storage
+  init      Choose the folder to sync and its Drive folder; writes config.toml
+            --local PATH  --remote CloudSync/NAME  --max-file-size 500MB  --force
   plan      Dry run: show what the first sync would do (changes nothing)
             --all  list every entry instead of the first 20 per section
   sync      Run the first sync: upload, download and keep both copies of
@@ -51,6 +53,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runLogout(ctx)
 	case "whoami":
 		return runWhoami(ctx)
+	case "init":
+		return runInit(ctx, args)
 	case "plan":
 		return runPlan(ctx, args)
 	case "sync":

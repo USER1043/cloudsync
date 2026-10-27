@@ -4,6 +4,7 @@ package localfs
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -26,11 +27,16 @@ type File struct {
 
 // Result is everything Scan found under a sync root.
 type Result struct {
-	Files   []File
-	Dirs    []string       // folders that are synced, including empty ones
-	Repos   []string       // folders skipped because they are git repositories
-	Ignored []string       // entries skipped by ignore rules; folders end in "/"
-	Issues  []filter.Issue // entries that cannot be synced as they are
+	Files    []File
+	Dirs     []string       // folders that are synced, including empty ones
+	Repos    []string       // folders skipped because they are git repositories
+	Ignored  []string       // entries skipped by ignore rules; folders end in "/"
+	TooLarge []File         // files over the size limit
+	Issues   []filter.Issue // entries that cannot be synced as they are
+
+	// Matcher is the scan's matcher plus every .cloudsyncignore found, for
+	// applying the same rules to the Drive side.
+	Matcher *filter.Matcher
 }
 
 // maxRelPath keeps root-relative paths short enough to stay within Windows'
@@ -38,7 +44,8 @@ type Result struct {
 const maxRelPath = 240
 
 // Scan walks root and sorts every entry into synced files, skipped git
-// repositories, ignored entries and issues. It reads metadata only.
+// repositories, ignored entries and issues. Besides m's rules it applies any
+// .cloudsyncignore files it finds. It reads metadata and ignore files only.
 func Scan(root string, m *filter.Matcher) (*Result, error) {
 	info, err := os.Stat(root)
 	if err != nil {
@@ -48,7 +55,11 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 		return nil, fmt.Errorf("sync root %s is not a folder", root)
 	}
 
-	res := &Result{}
+	m = m.Clone()
+	if err := loadIgnoreFile(m, root, ""); err != nil {
+		return nil, err
+	}
+	res := &Result{Matcher: m}
 	names := make(map[string]map[string]string) // parent rel -> lower-cased name -> name
 	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if p == root {
@@ -64,11 +75,11 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 		}
 
 		name, isDir := d.Name(), d.IsDir()
-		if isDir && m.IgnoreDir(name) {
-			res.Ignored = append(res.Ignored, rel+"/")
-			return fs.SkipDir
-		}
-		if !isDir && m.IgnoreFile(name) {
+		if m.Match(rel, isDir) {
+			if isDir {
+				res.Ignored = append(res.Ignored, rel+"/")
+				return fs.SkipDir
+			}
 			res.Ignored = append(res.Ignored, rel)
 			return nil
 		}
@@ -87,13 +98,21 @@ func Scan(root string, m *filter.Matcher) (*Result, error) {
 				return fs.SkipDir
 			}
 			res.Dirs = append(res.Dirs, rel)
+			// Rules in this folder's .cloudsyncignore apply to everything below it,
+			// which WalkDir visits next.
+			return loadIgnoreFile(m, p, rel)
 		case d.Type().IsRegular():
 			fi, err := d.Info()
 			if err != nil {
 				res.Issues = append(res.Issues, filter.Issue{Rel: rel, Reason: err.Error()})
 				return nil
 			}
-			res.Files = append(res.Files, File{Rel: rel, Size: fi.Size(), ModTime: fi.ModTime()})
+			f := File{Rel: rel, Size: fi.Size(), ModTime: fi.ModTime()}
+			if m.TooLarge(f.Size) {
+				res.TooLarge = append(res.TooLarge, f)
+				return nil
+			}
+			res.Files = append(res.Files, f)
 		case d.Type()&fs.ModeSymlink != 0:
 			res.Issues = append(res.Issues, filter.Issue{Rel: rel, Reason: "symlink; only regular files are synced"})
 		default:
@@ -125,6 +144,20 @@ func checkPath(names map[string]map[string]string, rel, name string) string {
 	}
 	names[parent][lower] = name
 	return ""
+}
+
+// loadIgnoreFile adds the rules of dir's .cloudsyncignore, if it has one, to
+// m. rel is dir relative to the sync root. A broken rule stops the scan
+// rather than risk syncing files the user meant to skip.
+func loadIgnoreFile(m *filter.Matcher, dir, rel string) error {
+	b, err := os.ReadFile(filepath.Join(dir, filter.IgnoreFile))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return m.AddFile(rel, b)
 }
 
 // isRepo reports whether dir is a git repository or worktree. Worktrees and

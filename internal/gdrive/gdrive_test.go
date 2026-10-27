@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"google.golang.org/api/googleapi"
+
+	"github.com/USER1043/cloudsync/internal/filter"
 )
 
 func TestRetryable(t *testing.T) {
@@ -119,6 +121,36 @@ func TestRangeStart(t *testing.T) {
 		if got := rangeStart(h); got != want {
 			t.Errorf("rangeStart(%q) = %d, want %d", h, got, want)
 		}
+	}
+}
+
+func TestTreeFilter(t *testing.T) {
+	tree := &Tree{
+		Folders: []File{{Rel: "A/B"}, {Rel: "A"}, {Rel: "C"}},
+		Files: []File{
+			{Rel: "A/B/x.pdf", Size: 1}, {Rel: "C/disk.iso", Size: 1},
+			{Rel: "huge.bin", Size: 5000}, {Rel: "ok.txt", Size: 1},
+		},
+		Native: []File{{Rel: "A/doc"}, {Rel: "C/sheet"}},
+	}
+	m, err := filter.New([]string{"/A/", "*.iso"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SetMaxSize(1000)
+
+	got, skipped := tree.Filter(m)
+	rels := func(fs []File) (out []string) {
+		for _, f := range fs {
+			out = append(out, f.Rel)
+		}
+		return out
+	}
+	if fmt.Sprint(rels(got.Folders)) != "[C]" || fmt.Sprint(rels(got.Files)) != "[ok.txt]" || fmt.Sprint(rels(got.Native)) != "[C/sheet]" {
+		t.Errorf("kept folders %v, files %v, native %v", rels(got.Folders), rels(got.Files), rels(got.Native))
+	}
+	if fmt.Sprint(skipped) != "[A/ C/disk.iso huge.bin]" {
+		t.Errorf("skipped = %v", skipped)
 	}
 }
 

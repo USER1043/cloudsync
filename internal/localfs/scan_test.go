@@ -67,6 +67,51 @@ func TestScan(t *testing.T) {
 	}
 }
 
+func TestScanIgnoreFilesAndSizeLimit(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, filter.IgnoreFile, "/Videos/\n")
+	write(t, root, "Videos/lecture.mp4", "v")
+	write(t, root, "Sub/"+filter.IgnoreFile, "*.log\n")
+	write(t, root, "Sub/run.log", "log")
+	write(t, root, "Sub/keep.txt", "k")
+	write(t, root, "Other/run.log", "not covered by Sub's rules")
+	write(t, root, "big.bin", strings.Repeat("x", 2000))
+
+	m, _ := filter.New(nil)
+	m.SetMaxSize(1000)
+	res, err := Scan(root, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []string
+	for _, f := range res.Files {
+		files = append(files, f.Rel)
+	}
+	// Ignore files themselves sync, so the rules apply on every computer.
+	wantFiles := []string{filter.IgnoreFile, "Other/run.log", "Sub/" + filter.IgnoreFile, "Sub/keep.txt"}
+	if !slices.Equal(files, wantFiles) {
+		t.Errorf("files = %v, want %v", files, wantFiles)
+	}
+	if want := []string{"Sub/run.log", "Videos/"}; !slices.Equal(res.Ignored, want) {
+		t.Errorf("ignored = %v, want %v", res.Ignored, want)
+	}
+	if len(res.TooLarge) != 1 || res.TooLarge[0].Rel != "big.bin" {
+		t.Errorf("too large = %v, want big.bin", res.TooLarge)
+	}
+	if !res.Matcher.Match("Sub/x.log", false) || m.Match("Sub/x.log", false) {
+		t.Error("result matcher should carry Sub's rules without changing the caller's matcher")
+	}
+}
+
+func TestScanBadIgnoreFile(t *testing.T) {
+	root := t.TempDir()
+	write(t, root, "Sub/"+filter.IgnoreFile, "[unclosed\n")
+	m, _ := filter.New(nil)
+	if _, err := Scan(root, m); err == nil || !strings.Contains(err.Error(), "Sub/.cloudsyncignore line 1") {
+		t.Errorf("err = %v, want it to name the broken rule", err)
+	}
+}
+
 func TestScanSymlink(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, "real.txt", "x")

@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -283,6 +285,73 @@ func (c *Client) ListTree(ctx context.Context, folderID string) (*Tree, error) {
 		}
 	}
 	return t, nil
+}
+
+// Filter returns the tree without what m skips: ignored files and folders,
+// everything inside ignored folders, and files over the size limit. It also
+// returns the paths it left out, folders ending in "/".
+func (t *Tree) Filter(m *filter.Matcher) (*Tree, []string) {
+	out := &Tree{Issues: t.Issues}
+	var skipped []string
+	ignoredDirs := make(map[string]bool)
+	inIgnored := func(rel string) bool {
+		for dir := path.Dir(rel); dir != "."; dir = path.Dir(dir) {
+			if ignoredDirs[dir] {
+				return true
+			}
+		}
+		return false
+	}
+
+	folders := slices.Clone(t.Folders)
+	slices.SortFunc(folders, func(a, b File) int { return strings.Compare(a.Rel, b.Rel) }) // parents first
+	for _, f := range folders {
+		switch {
+		case inIgnored(f.Rel):
+			ignoredDirs[f.Rel] = true
+		case m.Match(f.Rel, true):
+			ignoredDirs[f.Rel] = true
+			skipped = append(skipped, f.Rel+"/")
+		default:
+			out.Folders = append(out.Folders, f)
+		}
+	}
+	for _, f := range t.Files {
+		switch {
+		case inIgnored(f.Rel):
+		case m.Match(f.Rel, false) || m.TooLarge(f.Size):
+			skipped = append(skipped, f.Rel)
+		default:
+			out.Files = append(out.Files, f)
+		}
+	}
+	for _, f := range t.Native {
+		if !inIgnored(f.Rel) && !m.Match(f.Rel, false) {
+			out.Native = append(out.Native, f)
+		}
+	}
+	return out, skipped
+}
+
+// SubFolders lists the names of the folders directly inside the folder at
+// segments under My Drive, or nil if that folder does not exist.
+func (c *Client) SubFolders(ctx context.Context, segments []string) ([]string, error) {
+	id, err := c.FindFolder(ctx, segments)
+	if err != nil || id == "" {
+		return nil, err
+	}
+	children, err := c.listChildren(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, f := range children {
+		if f.MimeType == folderMime {
+			names = append(names, f.Name)
+		}
+	}
+	slices.Sort(names)
+	return names, nil
 }
 
 func (c *Client) listChildren(ctx context.Context, folderID string) ([]*drive.File, error) {
