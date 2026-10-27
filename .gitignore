@@ -1,0 +1,37 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Local config and secrets (OAuth client secret, tokens) - never commit
+config.toml
+*.local.toml
+client_secret*.json
+credentials*.json
+token*.json
+.env
+
+# Local sync state
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

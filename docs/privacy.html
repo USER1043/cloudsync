@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CloudSync Privacy Policy</title>
+  <meta name="description" content="How CloudSync accesses, uses, stores and shares Google user data.">
+  <style>
+    :root { --bg: #ffffff; --fg: #1f2328; --muted: #59636e; --accent: #0969da; --border: #d1d9e0; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #0d1117; --fg: #e6edf3; --muted: #9198a1; --accent: #4493f8; --border: #3d444d; }
+    }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { max-width: 720px; margin: 0 auto; padding: 48px 16px; }
+    h1 { margin: 0 0 4px; font-size: 2rem; }
+    .updated { margin: 0 0 32px; color: var(--muted); }
+    h2 { margin-top: 32px; font-size: 1.25rem; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+    a { color: var(--accent); }
+    footer { margin-top: 48px; color: var(--muted); font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Privacy Policy</h1>
+  <p class="updated">CloudSync &middot; Effective 27 October 2026</p>
+
+  <p>CloudSync is a personal, non-commercial file sync tool that runs on its developer's own computers and works with their own Google account. This policy explains what Google user data CloudSync accesses and how that data is handled.</p>
+
+  <h2>Data CloudSync accesses</h2>
+  <p>After the user signs in with Google and grants permission, CloudSync uses the Google Drive API to:</p>
+  <ul>
+    <li>list files and folders, and read their metadata (names, sizes, checksums, modification times and change history), so it can tell what changed;</li>
+    <li>download and upload file contents inside its sync folder;</li>
+    <li>move files to the Google Drive trash when they are deleted locally;</li>
+    <li>create sharing links, only when the user explicitly asks for one.</li>
+  </ul>
+  <p>CloudSync only works inside its own sync folder in Google Drive. It does not read Gmail, Contacts, Calendar, Photos or any other Google service.</p>
+
+  <h2>How the data is used</h2>
+  <p>Google user data is used only to keep the user's local folder and their Google Drive folder identical. It is not used for advertising, analytics, profiling, or training machine-learning models.</p>
+
+  <h2>Where the data is stored</h2>
+  <ul>
+    <li><strong>Files</strong> are stored only on the user's own computer and in the user's own Google Drive.</li>
+    <li><strong>Sign-in tokens</strong> are stored in the operating system's secure credential store (Windows Credential Manager or KDE Wallet) on the user's computer.</li>
+    <li><strong>Sync state</strong> (file names, paths, checksums and timestamps) is kept in a local database on the user's computer.</li>
+  </ul>
+  <p>CloudSync has no server. No data is sent to the developer or to any party other than Google.</p>
+
+  <h2>Sharing</h2>
+  <p>CloudSync does not sell, rent, transfer or disclose Google user data to anyone. Files are shared only when the user explicitly creates a sharing link for a specific file.</p>
+
+  <h2>Limited Use</h2>
+  <p>CloudSync's use and transfer of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+
+  <h2>Retention and deletion</h2>
+  <p>Local sync state and tokens remain on the user's computer until CloudSync is uninstalled or its data folder is deleted. Access can be revoked at any time at <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>. Files in Google Drive remain under the user's control and are never deleted by CloudSync except to mirror a deletion the user made locally, and those go to the Google Drive trash.</p>
+
+  <h2>Changes</h2>
+  <p>If this policy changes, the updated version will be published on this page with a new effective date.</p>
+
+  <footer>
+    <a href="index.html">CloudSync home</a>
+  </footer>
+</main>
+</body>
+</html>
