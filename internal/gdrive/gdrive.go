@@ -3,6 +3,7 @@ package gdrive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -99,6 +100,7 @@ type File struct {
 	MD5      string
 	Size     int64
 	ModTime  time.Time
+	Trashed  bool // set only by Update, for a file found in the trash or gone
 }
 
 func toFile(f *drive.File, rel string) File {
@@ -259,6 +261,102 @@ func (c *Client) Download(ctx context.Context, id string, w io.Writer) error {
 	defer resp.Body.Close()
 	_, err = io.Copy(w, resp.Body)
 	return err
+}
+
+// ErrChanged reports that a Drive file is no longer what CloudSync last saw:
+// edited, trashed or deleted by someone else, such as the phone.
+var ErrChanged = errors.New("changed in Drive since it was last checked")
+
+// Update replaces the content of the Drive file id with the local file at
+// localPath, keeping the file's ID, links and version history. It first
+// checks that Drive's copy still has the checksum want (the one CloudSync
+// last synced), so a newer edit made elsewhere is never overwritten: if not,
+// it returns the file as it is now, with Trashed set if it is gone, and an
+// error wrapping ErrChanged. md5sum is the local checksum; a retry that finds
+// it already in place is done.
+func (c *Client) Update(ctx context.Context, id, localPath string, modTime time.Time, md5sum, want string, progress func(sent int64)) (File, error) {
+	var out File
+	err := Retry(ctx, func() error {
+		cur, err := c.get(ctx, id)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !cur.Trashed && cur.MD5 == md5sum:
+			out = cur // an earlier attempt went through
+			return nil
+		case cur.Trashed || cur.MD5 != want:
+			out = cur
+			return fmt.Errorf("updating %q: %w", cur.Rel, ErrChanged)
+		}
+		f, err := os.Open(localPath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		meta := &drive.File{ModifiedTime: modTime.UTC().Format(time.RFC3339Nano)}
+		res, err := c.srv.Files.Update(id, meta).Media(f, googleapi.ChunkSize(chunkSize)).Fields(fileFields).
+			Context(withProgress(ctx, progress)).Do()
+		if err != nil {
+			return err
+		}
+		out = toFile(res, res.Name)
+		return nil
+	})
+	return out, err
+}
+
+// get returns the file id, with Trashed set if it is in the trash or no
+// longer exists. Rel is just the file's name.
+func (c *Client) get(ctx context.Context, id string) (File, error) {
+	f, err := c.srv.Files.Get(id).Fields(fileFields + ", trashed").Context(ctx).Do()
+	if isNotFound(err) {
+		return File{ID: id, Trashed: true}, nil
+	}
+	if err != nil {
+		return File{}, err
+	}
+	out := toFile(f, f.Name)
+	out.Trashed = f.Trashed
+	return out, nil
+}
+
+// Trash moves the file or folder id to Drive's trash, from which the owner
+// can restore it for 30 days. Trashing a folder trashes everything inside,
+// so callers check HasChildren first. A file that is already gone is fine.
+func (c *Client) Trash(ctx context.Context, id string) error {
+	err := Retry(ctx, func() error {
+		_, err := c.srv.Files.Update(id, &drive.File{Trashed: true}).Fields("id").Context(ctx).Do()
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("moving to Drive's trash: %w", err)
+	}
+	return nil
+}
+
+// HasChildren reports whether the Drive folder id holds anything that is not
+// in the trash, including items CloudSync doesn't sync, such as Google Docs.
+func (c *Client) HasChildren(ctx context.Context, id string) (bool, error) {
+	var any bool
+	err := Retry(ctx, func() error {
+		q := fmt.Sprintf("'%s' in parents and trashed = false", escape(id))
+		l, err := c.srv.Files.List().Q(q).Spaces("drive").PageSize(1).Fields("files(id)").Context(ctx).Do()
+		if err != nil {
+			return err
+		}
+		any = len(l.Files) > 0
+		return nil
+	})
+	return any, err
+}
+
+func isNotFound(err error) bool {
+	var ge *googleapi.Error
+	return errors.As(err, &ge) && ge.Code == http.StatusNotFound
 }
 
 // Tree is the contents of a Drive folder, recursively.

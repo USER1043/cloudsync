@@ -17,6 +17,7 @@ import (
 	"github.com/USER1043/cloudsync/internal/gdrive"
 	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/plan"
+	"github.com/USER1043/cloudsync/internal/reconcile"
 	"github.com/USER1043/cloudsync/internal/state"
 	"github.com/USER1043/cloudsync/internal/winname"
 )
@@ -30,6 +31,7 @@ type fakeDrive struct {
 	lookups, creates int      // folder requests, as the real Drive would see them
 	dupes            int      // CreateFolder calls where the folder already existed
 	uploads          []string // uploaded names, in the order they started
+	updates          int      // Update calls that replaced content
 }
 
 type node struct {
@@ -37,6 +39,8 @@ type node struct {
 	folder       bool
 	data         []byte
 	mod          time.Time
+	trashed      bool
+	native       bool // a Google Doc: listed in Tree.Native, never synced
 }
 
 func newFakeDrive() *fakeDrive {
@@ -109,6 +113,57 @@ func (f *fakeDrive) Download(_ context.Context, id string, w io.Writer) error {
 	return err
 }
 
+func (f *fakeDrive) Update(_ context.Context, id, localPath string, mod time.Time, md5sum, want string, progress func(int64)) (gdrive.File, error) {
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return gdrive.File{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.nodes[id]
+	cur := gdrive.File{ID: id, Rel: n.name, MD5: md5hex(n.data), Size: int64(len(n.data)), ModTime: n.mod, Trashed: n.trashed}
+	if n.trashed || cur.MD5 != want {
+		return cur, gdrive.ErrChanged
+	}
+	if progress != nil {
+		progress(int64(len(data)))
+	}
+	f.updates++
+	n.data, n.mod = data, mod
+	return gdrive.File{ID: id, Rel: n.name, MD5: md5hex(data), Size: int64(len(data)), ModTime: mod}, nil
+}
+
+func (f *fakeDrive) Trash(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if n := f.nodes[id]; n != nil {
+		n.trashed = true
+	}
+	return nil
+}
+
+func (f *fakeDrive) HasChildren(_ context.Context, id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, n := range f.nodes {
+		if n.parent == id && !n.trashed {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// find returns the ID of the item at rel under rootID, or "".
+func (f *fakeDrive) find(rootID, rel string) string {
+	t := f.tree(rootID)
+	for _, x := range append(t.Files, t.Folders...) {
+		if x.Rel == rel {
+			return x.ID
+		}
+	}
+	return ""
+}
+
 // put stores a file at rel under rootID, creating folders on the way.
 func (f *fakeDrive) put(t *testing.T, rootID, rel, body string, mod time.Time) {
 	t.Helper()
@@ -130,17 +185,20 @@ func (f *fakeDrive) tree(rootID string) *gdrive.Tree {
 	var walk func(id, rel string)
 	walk = func(id, rel string) {
 		for cid, n := range f.nodes {
-			if n.parent != id || cid == "root" {
+			if n.parent != id || cid == "root" || n.trashed {
 				continue
 			}
 			r := n.name
 			if rel != "" {
 				r = rel + "/" + n.name
 			}
-			if n.folder {
+			switch {
+			case n.folder:
 				t.Folders = append(t.Folders, gdrive.File{ID: cid, Rel: r})
 				walk(cid, r)
-			} else {
+			case n.native:
+				t.Native = append(t.Native, gdrive.File{ID: cid, Rel: r})
+			default:
 				t.Files = append(t.Files, gdrive.File{ID: cid, Rel: r, MD5: md5hex(n.data), Size: int64(len(n.data)), ModTime: n.mod})
 			}
 		}
@@ -168,6 +226,10 @@ type fixture struct {
 	// can't store get stand-ins, loaded from the state DB on each run.
 	windows bool
 	workers int // engine.Options.Workers; 0 for the default
+
+	trashDir string   // the fake OS trash used by resync
+	trashed  []string // names moved there, in order
+	trashMu  sync.Mutex
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -471,5 +533,286 @@ func TestLargestFilesFirst(t *testing.T) {
 	fx.sync()
 	if got, want := strings.Join(fx.drive.uploads, " "), "big.bin mid.pdf small.txt tiny.md"; got != want {
 		t.Errorf("upload order = %s, want %s", got, want)
+	}
+}
+
+// edit replaces the content of the Drive file at rel, as the phone would.
+func (f *fakeDrive) edit(t *testing.T, rootID, rel, body string) {
+	t.Helper()
+	id := f.find(rootID, rel)
+	if id == "" {
+		t.Fatalf("no Drive file %s", rel)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nodes[id].data, f.nodes[id].mod = []byte(body), time.Now()
+}
+
+func (f *fakeDrive) trash(t *testing.T, rootID, rel string) {
+	t.Helper()
+	id := f.find(rootID, rel)
+	if id == "" {
+		t.Fatalf("no Drive item %s", rel)
+	}
+	f.Trash(context.Background(), id)
+}
+
+func (fx *fixture) remove(rel string) {
+	if err := os.RemoveAll(filepath.Join(fx.local, filepath.FromSlash(rel))); err != nil {
+		fx.t.Fatal(err)
+	}
+}
+
+func (fx *fixture) exists(rel string) bool {
+	_, err := os.Lstat(filepath.Join(fx.local, filepath.FromSlash(rel)))
+	return err == nil
+}
+
+// edit rewrites a local file with a later modification time, as an editor
+// that saves within the same second would still leave a newer one.
+func (fx *fixture) edit(rel, body string) {
+	fx.write(rel, body)
+	p := filepath.Join(fx.local, filepath.FromSlash(rel))
+	later := time.Now().Add(time.Duration(len(body)+1) * time.Second)
+	if err := os.Chtimes(p, later, later); err != nil {
+		fx.t.Fatal(err)
+	}
+}
+
+// resync plans a later sync the way `cloudsync run` will, runs between, if
+// set, between planning and running, and runs it with a fake OS trash.
+func (fx *fixture) resync(between func()) (*Result, *reconcile.Plan) {
+	fx.t.Helper()
+	ctx := context.Background()
+	m, _ := filter.New(filter.DefaultIgnore)
+	scan, err := localfs.Scan(fx.local, m, nil)
+	if err != nil {
+		fx.t.Fatal(err)
+	}
+	tree := fx.drive.tree(fx.rootID)
+	base, err := fx.db.Items(ctx, "MyFiles")
+	if err != nil {
+		fx.t.Fatal(err)
+	}
+	p := reconcile.Reconcile(reconcile.Input{
+		Local: scan.Files, LocalDirs: scan.Dirs, Remote: tree.Files, RemoteDirs: tree.Folders, Base: base,
+		Hash: func(rel string) (string, error) {
+			return localfs.MD5File(filepath.Join(fx.local, filepath.FromSlash(rel)))
+		},
+	})
+	if between != nil {
+		between()
+	}
+	if fx.trashDir == "" {
+		fx.trashDir = fx.t.TempDir()
+	}
+	res, err := Sync(ctx, fx.drive, fx.db, Options{
+		Root: "MyFiles", Local: fx.local, RootID: fx.rootID, Label: "Linux",
+		Trash: func(p string) error {
+			fx.trashMu.Lock() // called by parallel workers
+			defer fx.trashMu.Unlock()
+			fx.trashed = append(fx.trashed, filepath.Base(p))
+			return os.Rename(p, filepath.Join(fx.trashDir, filepath.Base(p)))
+		},
+	}, scan, tree, p)
+	if err != nil {
+		fx.t.Fatal(err)
+	}
+	return res, p
+}
+
+// synced makes a fixture whose first sync is done, with files on both sides.
+func synced(t *testing.T, files map[string]string) *fixture {
+	fx := newFixture(t)
+	for rel, body := range files {
+		fx.write(rel, body)
+	}
+	if res, _ := fx.sync(); len(res.Failed) != 0 {
+		t.Fatalf("first sync failed: %v", res.Failed)
+	}
+	return fx
+}
+
+func TestSyncNothingChanged(t *testing.T) {
+	fx := synced(t, map[string]string{"a.txt": "alpha", "Sem5/b.pdf": "beta"})
+	res, p := fx.resync(nil)
+	if len(p.Actions) != 0 || res.Uploaded+res.Downloaded+res.Trashed+res.TrashedInDrive != 0 {
+		t.Errorf("plan %+v, result %+v; want nothing to do", p.Actions, res)
+	}
+}
+
+func TestSyncLocalEditUpdatesInPlace(t *testing.T) {
+	fx := synced(t, map[string]string{"a.txt": "alpha"})
+	id := fx.drive.find(fx.rootID, "a.txt")
+	fx.edit("a.txt", "alpha, edited")
+
+	res, _ := fx.resync(nil)
+	if res.Uploaded != 1 || len(res.Failed) != 0 || fx.drive.updates != 1 {
+		t.Fatalf("result %+v, %d updates", res, fx.drive.updates)
+	}
+	if got := fx.drive.find(fx.rootID, "a.txt"); got != id {
+		t.Errorf("Drive ID changed from %s to %s; the file should be updated in place", id, got)
+	}
+	if got := fx.drive.content(fx.rootID)["a.txt"]; got != "alpha, edited" {
+		t.Errorf("Drive has %q", got)
+	}
+	if res, p := fx.resync(nil); len(p.Actions) != 0 {
+		t.Errorf("after the update, the next run plans %+v (result %+v)", p.Actions, res)
+	}
+}
+
+func TestSyncDriveEditDownloads(t *testing.T) {
+	fx := synced(t, map[string]string{"a.txt": "alpha"})
+	fx.drive.edit(t, fx.rootID, "a.txt", "edited on the phone")
+
+	res, _ := fx.resync(nil)
+	if res.Downloaded != 1 || len(res.Failed) != 0 || fx.read("a.txt") != "edited on the phone" {
+		t.Errorf("result %+v, local %q", res, fx.read("a.txt"))
+	}
+	if _, p := fx.resync(nil); len(p.Actions) != 0 {
+		t.Errorf("after the download, the next run plans %+v", p.Actions)
+	}
+}
+
+func TestSyncDeletes(t *testing.T) {
+	fx := synced(t, map[string]string{"here.txt": "1", "there.txt": "2", "keep.txt": "3"})
+	fx.remove("here.txt")                     // deleted on this computer
+	fx.drive.trash(t, fx.rootID, "there.txt") // deleted on the phone
+
+	res, _ := fx.resync(nil)
+	if res.Trashed != 1 || res.TrashedInDrive != 1 || len(res.Failed) != 0 {
+		t.Fatalf("result %+v", res)
+	}
+	if _, ok := fx.drive.content(fx.rootID)["here.txt"]; ok {
+		t.Error("here.txt is still in Drive")
+	}
+	if fx.exists("there.txt") || fmt.Sprint(fx.trashed) != "[there.txt]" {
+		t.Errorf("there.txt: exists %v; trashed %v, want it moved to the OS trash", fx.exists("there.txt"), fx.trashed)
+	}
+	files, _, _ := fx.db.Count(context.Background(), "MyFiles")
+	if files != 1 {
+		t.Errorf("state has %d files, want only keep.txt", files)
+	}
+}
+
+func TestSyncFolderDeletedInDrive(t *testing.T) {
+	fx := synced(t, map[string]string{"Old/a.txt": "1", "Old/Sub/b.txt": "2", "x.txt": "3"})
+	fx.write("Old/.env", "ignored, never synced") // must not be trashed with the folder
+	fx.drive.trash(t, fx.rootID, "Old")
+
+	res, _ := fx.resync(nil)
+	if res.Trashed != 2 || len(res.Failed) != 0 {
+		t.Fatalf("result %+v", res)
+	}
+	if fx.exists("Old/Sub") || !fx.exists("Old/.env") {
+		t.Errorf("Old/Sub exists %v (want removed), Old/.env exists %v (want kept)", fx.exists("Old/Sub"), fx.exists("Old/.env"))
+	}
+	if res.FoldersRemoved != 1 {
+		t.Errorf("removed %d folders, want only Old/Sub; Old holds an ignored file", res.FoldersRemoved)
+	}
+}
+
+func TestSyncFolderDeletedHereKeepsGoogleDocs(t *testing.T) {
+	fx := synced(t, map[string]string{"Proj/a.txt": "1", "Empty/b.txt": "2"})
+	projID := fx.drive.find(fx.rootID, "Proj")
+	fx.drive.mu.Lock()
+	fx.drive.add(&node{parent: projID, name: "Plan", native: true}) // a Google Doc made on the phone
+	fx.drive.mu.Unlock()
+	fx.remove("Proj")
+	fx.remove("Empty")
+
+	res, _ := fx.resync(nil)
+	if res.TrashedInDrive != 2 || res.FoldersRemoved != 1 || len(res.Failed) != 0 {
+		t.Fatalf("result %+v", res)
+	}
+	if fx.drive.find(fx.rootID, "Proj") == "" {
+		t.Error("Proj was trashed in Drive along with the Google Doc inside it")
+	}
+	if fx.drive.find(fx.rootID, "Empty") != "" {
+		t.Error("the emptied folder Empty is still in Drive")
+	}
+}
+
+func TestSyncConflictAfterBothEdited(t *testing.T) {
+	fx := synced(t, map[string]string{"r.docx": "v1"})
+	fx.edit("r.docx", "laptop edit")
+	fx.drive.edit(t, fx.rootID, "r.docx", "phone edit")
+
+	res, _ := fx.resync(nil)
+	if res.Conflicts != 1 || len(res.Failed) != 0 || fx.read("r.docx") != "phone edit" {
+		t.Fatalf("result %+v, local %q", res, fx.read("r.docx"))
+	}
+	copies, _ := filepath.Glob(filepath.Join(fx.local, "r (conflict Linux *).docx"))
+	if len(copies) != 1 {
+		t.Fatalf("conflict copies %v", copies)
+	}
+	if got := fx.drive.content(fx.rootID)[filepath.Base(copies[0])]; got != "laptop edit" {
+		t.Errorf("Drive copy of the laptop edit = %q", got)
+	}
+}
+
+func TestSyncNeverOverwritesNewerDriveEdit(t *testing.T) {
+	// The phone edits the file after Drive was listed, just before the
+	// upload: the update must turn into a conflict, not overwrite it.
+	fx := synced(t, map[string]string{"r.docx": "v1"})
+	fx.edit("r.docx", "laptop edit")
+	res, _ := fx.resync(func() { fx.drive.edit(t, fx.rootID, "r.docx", "phone edit") })
+	if res.Conflicts != 1 || res.Uploaded != 0 || len(res.Failed) != 0 || fx.drive.updates != 0 {
+		t.Fatalf("result %+v, %d updates", res, fx.drive.updates)
+	}
+	drive := fx.drive.content(fx.rootID)
+	if drive["r.docx"] != "phone edit" || fx.read("r.docx") != "phone edit" || len(drive) != 2 {
+		t.Errorf("Drive %v, local %q; want the phone's version kept and the laptop's as a copy", drive, fx.read("r.docx"))
+	}
+}
+
+func TestSyncEditBeatsDeleteMidRun(t *testing.T) {
+	// Drive's copy is trashed after the listing: the laptop's edit is
+	// uploaded again as a new file.
+	fx := synced(t, map[string]string{"r.docx": "v1"})
+	fx.edit("r.docx", "laptop edit")
+	res, _ := fx.resync(func() { fx.drive.trash(t, fx.rootID, "r.docx") })
+	if res.Uploaded != 1 || len(res.Failed) != 0 || fx.drive.content(fx.rootID)["r.docx"] != "laptop edit" {
+		t.Errorf("result %+v, Drive %v", res, fx.drive.content(fx.rootID))
+	}
+}
+
+func TestSyncKeepsFilesEditedAfterScan(t *testing.T) {
+	fx := synced(t, map[string]string{"gone.txt": "1", "changed.txt": "2"})
+	fx.drive.trash(t, fx.rootID, "gone.txt")
+	fx.drive.edit(t, fx.rootID, "changed.txt", "phone edit")
+
+	// Both local files are saved again after the scan.
+	res, _ := fx.resync(func() {
+		fx.edit("gone.txt", "saved again")
+		fx.edit("changed.txt", "saved again too")
+	})
+	if res.Trashed != 0 || res.Downloaded != 0 || len(res.Failed) != 2 {
+		t.Fatalf("result %+v; want both refused", res)
+	}
+	if fx.read("gone.txt") != "saved again" || fx.read("changed.txt") != "saved again too" || len(fx.trashed) != 0 {
+		t.Error("a file saved after the scan was trashed or overwritten")
+	}
+	// The next run sees the edits: one beats the delete, one conflicts.
+	res, _ = fx.resync(nil)
+	if res.Uploaded != 1 || res.Conflicts != 1 || len(res.Failed) != 0 {
+		t.Errorf("next run %+v", res)
+	}
+}
+
+func TestSyncNewFilesBothWays(t *testing.T) {
+	fx := synced(t, map[string]string{"a.txt": "1"})
+	fx.write("New/here.txt", "from laptop")
+	fx.drive.put(t, fx.rootID, "Phone/there.jpg", "from phone", time.Now())
+
+	res, _ := fx.resync(nil)
+	if res.Uploaded != 1 || res.Downloaded != 1 || res.Folders != 1 || len(res.Failed) != 0 {
+		t.Fatalf("result %+v", res)
+	}
+	if fx.read("Phone/there.jpg") != "from phone" || fx.drive.content(fx.rootID)["New/here.txt"] != "from laptop" {
+		t.Error("new files did not cross over")
+	}
+	if _, p := fx.resync(nil); len(p.Actions) != 0 {
+		t.Errorf("next run plans %+v", p.Actions)
 	}
 }

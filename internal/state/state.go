@@ -153,6 +153,37 @@ func (d *DB) Get(ctx context.Context, root, rel string) (Item, bool, error) {
 	return it, true, nil
 }
 
+// Delete removes the item at root/rel, if there is one.
+func (d *DB) Delete(ctx context.Context, root, rel string) error {
+	if _, err := d.db.ExecContext(ctx, `DELETE FROM items WHERE root = ? AND rel = ?`, root, rel); err != nil {
+		return fmt.Errorf("removing %s from the state database: %w", rel, err)
+	}
+	return nil
+}
+
+// Items returns every item recorded for root, sorted by path: the base that
+// later syncs compare against.
+func (d *DB) Items(ctx context.Context, root string) ([]Item, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT rel, drive_id, is_dir, size, md5, local_mtime, synced_at, local_name
+		FROM items WHERE root = ? ORDER BY rel`, root)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Item
+	for rows.Next() {
+		it := Item{Root: root}
+		var isDir int
+		if err := rows.Scan(&it.Rel, &it.DriveID, &isDir, &it.Size, &it.MD5, &it.LocalMTime, &it.SyncedAt, &it.LocalName); err != nil {
+			return nil, err
+		}
+		it.IsDir = isDir != 0
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
 // Count returns how many files and folders are recorded for root.
 func (d *DB) Count(ctx context.Context, root string) (files, dirs int, err error) {
 	err = d.db.QueryRowContext(ctx, `

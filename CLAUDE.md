@@ -58,6 +58,26 @@ design for that limit, including quota checks.
 
 ## Status
 
+### Where we left off (2026-11-05): give the owner this when they ask
+
+Paused by the owner partway through Phase 3 (background service). Committed,
+not pushed.
+
+- **Works:** first sync on both OSes (done and verified), faster uploads.
+- **Built and tested, but not yet runnable:** the two-way sync logic. The
+  reconciler decides what each file needs, the big-delete guard holds more
+  than 50 files or 10% (each run logged so the threshold can be tuned), and
+  the engine carries it out: updates in place, downloads, trash to KDE
+  Trash or Recycle Bin and Drive's trash, keep-both conflicts, and
+  protection against edits made mid-sync.
+- **Not yet:** there is no `cloudsync run` command, so edits made after the
+  first sync still don't sync. The new Drive calls are untested against
+  real Drive, and the Recycle Bin code is untested on Windows.
+- **Next:** step 2, the `cloudsync run` catch-up at boot. Its Skip list must
+  include Google Docs, Drive duplicate names, files over the size limit and
+  unreadable files. Then live upload, shutdown blocking, error messages and
+  notifications, and start at login. After that, catch Windows up.
+
 | Phase | State |
 |---|---|
 | 1: `login`, `whoami`, `plan` dry run | done |
@@ -67,7 +87,7 @@ design for that limit, including quota checks.
 | Windows-name translation (`internal/winname`, `ISSUES.md` #1, #2) | done on Linux; verify on Windows |
 | Fedora first sync of `~/My_Files` | **done and verified** 2026-10-28: nothing failed; re-plan shows 1,341 files in sync, 0 to transfer |
 | Faster uploads (`ISSUES.md` #5) | **done** 2026-11-03: test sync of 52 folders + 73 files went from 122 s to 33 s |
-| 3: continuous two-way sync daemon (background service) | **in progress**: reconciler, big-delete guard and delete log done (`internal/reconcile`, `state.delete_log`) |
+| 3: continuous two-way sync daemon (background service) | **in progress**: reconciler, big-delete guard and delete log done; engine runs its actions (`engine.Sync`, `internal/trash`). Next: `cloudsync run` catch-up at boot |
 
 After a root's first sync, `cloudsync sync` only reports "already completed".
 Until Phase 3, later edits don't sync, and files coming from Fedora reach
@@ -155,12 +175,13 @@ Packages:
 | `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`; terminal progress bar (`progress.go`) |
 | `internal/config` | `config.toml` load/write/validate, `ParseSize`, per-OS dirs. No built-in default root: a missing config returns `ErrNoConfig` |
 | `internal/auth` | OAuth loopback + PKCE, token in OS keyring, refreshed tokens saved back |
-| `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, downloads, `Retry` (backoff on 429/5xx/rate-limit 403), `countingTransport` for upload progress, `Tree.Filter` |
+| `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, `Update` in place (refuses with `ErrChanged` if Drive's copy isn't the last-synced checksum), `Trash`, `HasChildren`, downloads, `Retry` (backoff on 429/5xx/rate-limit 403), `countingTransport` for upload progress, `Tree.Filter` |
 | `internal/filter` | gitignore-style `Matcher` (last match wins, `!`, anchored `/x/`, `**`, case-insensitive), `.cloudsyncignore`, size limit, `CheckName` for names no system can sync |
 | `internal/winname` | Windows stand-in names: `Encode` (pure), and `Map` (true path ↔ local name, case-insensitive taken names, `Found` for scans, `Assign` for new entries). A nil `*Map` is the identity, used on Linux |
 | `internal/localfs` | `Scan`: walks a root, skips repos, applies rules, flags issues, reports true paths through a `winname.Map`; `MD5File` |
 | `internal/plan` | `FirstSync`: pure union-merge planner; exact path matching |
-| `internal/engine` | Carries out a plan: folders a depth at a time (each depth in parallel; `CreateFolder` skips the lookup inside folders made in the same run), then 8 parallel transfers, largest first, MD5-verified, atomic downloads (`.name.cloudsync-partial` then rename), keep-both conflicts, progress callbacks |
+| `internal/engine` | Carries out a plan (`FirstSync` from `plan`, `Sync` from `reconcile`; both run the same reconcile actions): folders a depth at a time (each depth in parallel; `CreateFolder` skips the lookup inside folders made in the same run), then 8 parallel transfers, largest first, MD5-verified, atomic downloads (`.name.cloudsync-partial` then rename), keep-both conflicts, progress callbacks. `Sync` checks every change against what the plan saw: a local file saved after the scan is never overwritten or trashed, and an update that finds a newer Drive edit becomes a conflict. Trashes go to `Options.Trash` (default `trash.Move`) or Drive's trash; folders are removed only when empty |
+| `internal/trash` | `Move` to the OS trash: freedesktop.org Trash on Linux (home trash, or the file system's `.Trash-$uid` across devices/subvolumes), Recycle Bin via `SHFileOperationW` on Windows (asks before deleting outright what the Recycle Bin can't take) |
 | `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`); `delete_log` (each run's deletes, root size, whether the guard held them and the owner's answer) |
 | `internal/reconcile` | Phase 3 planner: `Reconcile`, a pure three-way comparison of scan, Drive tree and base (state DB) into actions (upload, download, trash here or in Drive, conflict, folders, record, forget, wait); `Skip` keeps paths missing for other reasons (too large, unreadable, repos) from being trashed. `Guard` interface with `DefaultGuard` (more than 50 files or 10%), `SplitDeletes` and `Undo` for held deletes |
 

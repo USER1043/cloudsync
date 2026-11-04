@@ -1,4 +1,5 @@
-// Package engine carries out syncs planned by package plan.
+// Package engine carries out syncs: first syncs planned by package plan, and
+// later ones planned by package reconcile.
 package engine
 
 import (
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -23,7 +25,9 @@ import (
 	"github.com/USER1043/cloudsync/internal/gdrive"
 	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/plan"
+	"github.com/USER1043/cloudsync/internal/reconcile"
 	"github.com/USER1043/cloudsync/internal/state"
+	"github.com/USER1043/cloudsync/internal/trash"
 	"github.com/USER1043/cloudsync/internal/winname"
 )
 
@@ -33,7 +37,10 @@ type Remote interface {
 	EnsureFolder(ctx context.Context, parentID, name string) (string, error)
 	CreateFolder(ctx context.Context, parentID, name string) (string, error)
 	Upload(ctx context.Context, parentID, name, localPath string, modTime time.Time, md5sum string, progress func(sent int64)) (gdrive.File, error)
+	Update(ctx context.Context, id, localPath string, modTime time.Time, md5sum, want string, progress func(sent int64)) (gdrive.File, error)
 	Download(ctx context.Context, id string, w io.Writer) error
+	Trash(ctx context.Context, id string) error
+	HasChildren(ctx context.Context, id string) (bool, error)
 }
 
 // Options configures one root's sync.
@@ -49,6 +56,10 @@ type Options struct {
 	// on Linux). It must be the Map the scan was made with. Plans and the
 	// state DB use true paths; Names turns them into local ones.
 	Names *winname.Map
+
+	// Trash moves a local file to the OS trash; trash.Move if nil. It is
+	// called from parallel workers.
+	Trash func(path string) error
 
 	// Progress, if set, is called when transfers start, as bytes move (at
 	// most every 200ms) and after each transfer finishes. Calls never overlap.
@@ -69,8 +80,11 @@ type Progress struct {
 // running the sync again retries them.
 type Result struct {
 	Uploaded, Downloaded, InSync, Conflicts, Folders int
+	Trashed, TrashedInDrive                          int // files moved to the local trash and to Drive's
+	FoldersRemoved                                   int // empty folders removed here or in Drive
 	Bytes                                            int64
 	Failed                                           []filter.Issue
+	Waiting                                          []filter.Issue // left for the next run (reconcile.Wait)
 }
 
 // FirstSync carries out a plan from plan.FirstSync. It never deletes or
@@ -78,6 +92,60 @@ type Result struct {
 // a local file has appeared at its path. It returns an error only when it
 // cannot go on at all; individual file failures are listed in the Result.
 func FirstSync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan) (*Result, error) {
+	remote := make(map[string]string, len(tree.Files))
+	for _, f := range tree.Files {
+		remote[f.Rel] = f.ID
+	}
+	acts := make([]reconcile.Action, 0, len(p.Items))
+	for _, it := range p.Items {
+		a := reconcile.Action{Rel: it.Rel, Size: it.Size, Note: it.Note, DriveID: remote[it.Rel]}
+		switch it.Kind {
+		case plan.Upload:
+			a.Op, a.DriveID = reconcile.Upload, ""
+		case plan.Download:
+			a.Op = reconcile.Download
+		case plan.Conflict:
+			a.Op = reconcile.Conflict
+		case plan.InSync:
+			a.Op = reconcile.Record
+		}
+		acts = append(acts, a)
+	}
+	// Every local folder goes to Drive and every Drive folder comes here.
+	localDirs := make([]string, len(tree.Folders))
+	for i, f := range tree.Folders {
+		localDirs[i] = f.Rel
+	}
+	return execute(ctx, r, db, opt, scan, tree, acts, scan.Dirs, localDirs)
+}
+
+// Sync carries out a plan from reconcile.Reconcile, in this order: state-only
+// records, folders to create, then transfers and file trashes in parallel
+// (largest first), then empty folders to remove, deepest first. If the
+// big-delete guard holds the plan, pass the rest from SplitDeletes.
+//
+// Every change is checked against what the plan saw, so nothing made since is
+// lost: a local file edited after the scan is neither overwritten nor
+// trashed, and an upload that would replace a Drive file edited meanwhile
+// (on the phone, say) becomes a conflict that keeps both. Trashed files go to
+// the OS trash or Drive's trash, never deleted outright.
+func Sync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *localfs.Result, tree *gdrive.Tree, p *reconcile.Plan) (*Result, error) {
+	var remoteDirs, localDirs []string
+	for _, a := range p.Actions {
+		switch a.Op {
+		case reconcile.MkdirRemote:
+			remoteDirs = append(remoteDirs, a.Rel)
+		case reconcile.MkdirLocal:
+			localDirs = append(localDirs, a.Rel)
+		}
+	}
+	return execute(ctx, r, db, opt, scan, tree, p.Actions, remoteDirs, localDirs)
+}
+
+// execute runs acts. remoteDirs are folders to make in Drive and localDirs
+// folders to make here, besides the Drive parents uploads need.
+func execute(ctx context.Context, r Remote, db *state.DB, opt Options, scan *localfs.Result, tree *gdrive.Tree,
+	acts []reconcile.Action, remoteDirs, localDirs []string) (*Result, error) {
 	if opt.Workers <= 0 {
 		// Large files are limited by the uplink, which one transfer nearly
 		// fills; small files by about 2 s per request, which more parallel
@@ -86,6 +154,9 @@ func FirstSync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *l
 	}
 	if opt.Log == nil {
 		opt.Log = io.Discard
+	}
+	if opt.Trash == nil {
+		opt.Trash = trash.Move
 	}
 	s := &run{
 		ctx: ctx, r: r, db: db, opt: opt, now: time.Now(),
@@ -105,57 +176,81 @@ func FirstSync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *l
 		s.folders[f.Rel] = f.ID
 	}
 
-	if err := s.makeFolders(scan, tree, p); err != nil {
+	if err := s.makeFolders(acts, remoteDirs, localDirs); err != nil {
 		return &s.res, err
 	}
 
 	// Choose every new local name before the transfers run in parallel, so
 	// the choice doesn't depend on which transfer happens to go first.
-	var jobs []plan.Item
-	for _, it := range p.Items {
-		switch it.Kind {
-		case plan.InSync:
-			if err := s.recordInSync(it); err != nil {
+	var jobs, emptyDirs []reconcile.Action
+	for _, a := range acts {
+		switch {
+		case a.Op == reconcile.MkdirLocal || a.Op == reconcile.MkdirRemote:
+			continue // done by makeFolders
+		case a.Op == reconcile.Record:
+			if err := s.recordSame(a); err != nil {
 				return &s.res, err
 			}
 			continue
-		case plan.Download:
-			opt.Names.Assign(it.Rel)
-		case plan.Conflict:
-			s.copies[it.Rel] = s.conflictName(it.Rel)
-			opt.Names.Assign(s.copies[it.Rel])
+		case a.Op == reconcile.Forget:
+			if err := s.db.Delete(ctx, opt.Root, a.Rel); err != nil {
+				return &s.res, err
+			}
+			continue
+		case a.Op == reconcile.Wait:
+			s.res.Waiting = append(s.res.Waiting, filter.Issue{Rel: a.Rel, Reason: a.Note})
+			continue
+		case a.Dir: // a folder to remove once empty
+			emptyDirs = append(emptyDirs, a)
+			continue
+		case a.Op == reconcile.Download:
+			opt.Names.Assign(a.Rel)
+		case a.Op == reconcile.Conflict:
+			s.copies[a.Rel] = s.conflictName(a.Rel)
+			opt.Names.Assign(s.copies[a.Rel])
 		}
-		jobs = append(jobs, it)
-		s.totalBytes += it.Size
+		jobs = append(jobs, a)
+		s.totalBytes += moved(a)
 	}
 	// Largest first, so big files run while small ones fill the gaps rather
 	// than one big file running alone at the end.
-	slices.SortStableFunc(jobs, func(a, b plan.Item) int { return cmp.Compare(b.Size, a.Size) })
+	slices.SortStableFunc(jobs, func(a, b reconcile.Action) int { return cmp.Compare(moved(b), moved(a)) })
 	s.total = len(jobs)
 	s.report()
 
-	ch := make(chan plan.Item)
+	ch := make(chan reconcile.Action)
 	var wg sync.WaitGroup
 	for range opt.Workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for it := range ch {
-				s.do(it)
+			for a := range ch {
+				s.do(a)
 			}
 		}()
 	}
 feed:
-	for _, it := range jobs {
+	for _, a := range jobs {
 		select {
-		case ch <- it:
+		case ch <- a:
 		case <-ctx.Done():
 			break feed
 		}
 	}
 	close(ch)
 	wg.Wait()
+	if ctx.Err() == nil {
+		s.removeFolders(emptyDirs)
+	}
 	return &s.res, ctx.Err()
+}
+
+// moved is the bytes an action transfers; trashing moves none.
+func moved(a reconcile.Action) int64 {
+	if a.Op == reconcile.TrashLocal || a.Op == reconcile.TrashRemote {
+		return 0
+	}
+	return a.Size
 }
 
 type run struct {
@@ -168,7 +263,9 @@ type run struct {
 	local   map[string]localfs.File
 	remote  map[string]gdrive.File
 	folders map[string]string // rel -> Drive folder ID; "" is the root. Read-only once transfers start.
-	copies  map[string]string // conflict rel -> rel of the local version's copy. Read-only once transfers start.
+
+	namesMu sync.Mutex        // guards copies once transfers start
+	copies  map[string]string // conflict rel -> rel of the local version's copy
 
 	mu         sync.Mutex // guards res, the progress counters and writes to opt.Log
 	res        Result
@@ -194,35 +291,39 @@ func (s *run) report() {
 }
 
 // tracker returns a callback that records the bytes moved for one planned
-// transfer. It never goes backwards (a retry restarts from zero) or past the
-// planned size, and it reports at most every reportEvery.
-func (s *run) tracker(it plan.Item) func(int64) {
+// transfer of size bytes. It never goes backwards (a retry restarts from
+// zero) or past the planned size, and it reports at most every reportEvery.
+func (s *run) tracker(rel string, size int64) func(int64) {
 	return func(n int64) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		n = min(n, it.Size)
-		if n <= s.inflight[it.Rel] {
+		n = min(n, size)
+		if n <= s.inflight[rel] {
 			return
 		}
-		s.inflight[it.Rel] = n
+		s.inflight[rel] = n
 		if time.Since(s.lastReport) >= reportEvery {
 			s.report()
 		}
 	}
 }
 
-// makeFolders creates, before any transfer starts, every Drive folder that
-// uploads need and every local folder that exists in Drive.
-func (s *run) makeFolders(scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan) error {
+// makeFolders creates, before any transfer starts, the Drive folders in
+// remoteDirs and those that uploads need, and the local folders in
+// localDirs, and records them all.
+func (s *run) makeFolders(acts []reconcile.Action, remoteDirs, localDirs []string) error {
 	need := make(map[string]bool)
-	for _, d := range scan.Dirs {
-		need[d] = true
+	addWithParents := func(rel string) {
+		for ; rel != "." && rel != ""; rel = path.Dir(rel) {
+			need[rel] = true
+		}
 	}
-	for _, it := range p.Items {
-		if it.Kind == plan.Upload || it.Kind == plan.Conflict {
-			for dir := path.Dir(it.Rel); dir != "."; dir = path.Dir(dir) {
-				need[dir] = true
-			}
+	for _, d := range remoteDirs {
+		addWithParents(d)
+	}
+	for _, a := range acts {
+		if a.Op == reconcile.Upload || a.Op == reconcile.Conflict {
+			addWithParents(path.Dir(a.Rel))
 		}
 	}
 	// Create the missing Drive folders a depth at a time, the folders of each
@@ -247,19 +348,16 @@ func (s *run) makeFolders(scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan)
 		}
 	}
 
-	local := slices.Clone(tree.Folders)
-	slices.SortFunc(local, func(a, b gdrive.File) int { return strings.Compare(a.Rel, b.Rel) }) // parents first
-	for _, f := range local {
-		s.opt.Names.Assign(f.Rel)
-		if err := os.MkdirAll(s.abs(f.Rel), 0o755); err != nil {
+	local := slices.Sorted(slices.Values(localDirs)) // parents first
+	for _, rel := range local {
+		s.opt.Names.Assign(rel)
+		if err := os.MkdirAll(s.abs(rel), 0o755); err != nil {
 			return err
 		}
+		need[rel] = true
 	}
-	for rel, id := range s.folders {
-		if rel == "" {
-			continue
-		}
-		if err := s.record(state.Item{Root: s.opt.Root, Rel: rel, DriveID: id, IsDir: true, SyncedAt: s.now.Unix()}); err != nil {
+	for _, rel := range slices.Sorted(maps.Keys(need)) {
+		if err := s.record(state.Item{Root: s.opt.Root, Rel: rel, DriveID: s.folders[rel], IsDir: true, SyncedAt: s.now.Unix()}); err != nil {
 			return err
 		}
 	}
@@ -308,59 +406,95 @@ func (s *run) record(it state.Item) error {
 	return s.db.Put(s.ctx, it)
 }
 
-func (s *run) recordInSync(it plan.Item) error {
-	lf, rf := s.local[it.Rel], s.remote[it.Rel]
+// recordSame records a path that already matches on both sides.
+func (s *run) recordSame(a reconcile.Action) error {
+	if a.Dir {
+		return s.record(state.Item{Root: s.opt.Root, Rel: a.Rel, DriveID: a.DriveID, IsDir: true, SyncedAt: s.now.Unix()})
+	}
+	lf, rf := s.local[a.Rel], s.remote[a.Rel]
 	s.res.InSync++
 	return s.record(state.Item{
-		Root: s.opt.Root, Rel: it.Rel, DriveID: rf.ID, Size: lf.Size, MD5: rf.MD5,
+		Root: s.opt.Root, Rel: a.Rel, DriveID: rf.ID, Size: lf.Size, MD5: rf.MD5,
 		LocalMTime: lf.ModTime.UnixNano(), SyncedAt: s.now.Unix(),
 	})
 }
 
-func (s *run) do(it plan.Item) {
+func (s *run) do(a reconcile.Action) {
 	var (
-		n    int64
-		err  error
-		verb string
+		n   int64
+		err error
 	)
-	track := s.tracker(it)
-	switch it.Kind {
-	case plan.Upload:
-		verb = "upload"
-		n, err = s.upload(it.Rel, track)
-	case plan.Download:
-		verb = "download"
-		n, err = s.download(it.Rel, track)
-	case plan.Conflict:
-		verb = "conflict"
-		n, err = s.conflict(it, track)
+	did := a.Op
+	track := s.tracker(a.Rel, moved(a))
+	switch a.Op {
+	case reconcile.Upload:
+		if a.DriveID != "" {
+			n, did, err = s.update(a.Rel, a.DriveID, track)
+		} else {
+			n, err = s.upload(a.Rel, track)
+		}
+	case reconcile.Download:
+		n, err = s.download(a.Rel, s.remote[a.Rel], track)
+	case reconcile.Conflict:
+		n, err = s.conflict(a.Rel, s.remote[a.Rel], track)
+	case reconcile.TrashLocal:
+		err = s.trashLocal(a.Rel)
+	case reconcile.TrashRemote:
+		err = s.trashRemote(a.Rel, a.DriveID)
+	default:
+		err = fmt.Errorf("unexpected action %v", a.Op)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.done++
-	delete(s.inflight, it.Rel)
-	s.doneBytes += it.Size
+	delete(s.inflight, a.Rel)
+	s.doneBytes += moved(a)
 	defer s.report()
 	if err != nil {
-		s.res.Failed = append(s.res.Failed, filter.Issue{Rel: it.Rel, Reason: err.Error()})
-		fmt.Fprintf(s.opt.Log, "[%d/%d] FAILED %s %s: %v\n", s.done, s.total, verb, it.Rel, err)
+		s.res.Failed = append(s.res.Failed, filter.Issue{Rel: a.Rel, Reason: err.Error()})
+		fmt.Fprintf(s.opt.Log, "[%d/%d] FAILED %s %s: %v\n", s.done, s.total, verb(a), a.Rel, err)
 		return
 	}
-	switch it.Kind {
-	case plan.Upload:
+	switch did {
+	case reconcile.Upload:
 		s.res.Uploaded++
-	case plan.Download:
+	case reconcile.Download:
 		s.res.Downloaded++
-	case plan.Conflict:
+	case reconcile.Conflict:
 		s.res.Conflicts++
+	case reconcile.TrashLocal:
+		s.res.Trashed++
+	case reconcile.TrashRemote:
+		s.res.TrashedInDrive++
 	}
 	s.res.Bytes += n
-	fmt.Fprintf(s.opt.Log, "[%d/%d] %-8s %s\n", s.done, s.total, verb, it.Rel)
+	fmt.Fprintf(s.opt.Log, "[%d/%d] %-8s %s\n", s.done, s.total, verb(reconcile.Action{Op: did, DriveID: a.DriveID}), a.Rel)
 }
 
-// upload sends the local file at rel to Drive, checks Drive's checksum
-// against the local one and records the result. track receives bytes sent.
+// verb names an action in the log.
+func verb(a reconcile.Action) string {
+	switch a.Op {
+	case reconcile.Upload:
+		if a.DriveID != "" {
+			return "update"
+		}
+		return "upload"
+	case reconcile.Download:
+		return "download"
+	case reconcile.Conflict:
+		return "conflict"
+	case reconcile.TrashLocal:
+		return "trash"
+	case reconcile.TrashRemote:
+		return "trash in Drive"
+	}
+	return a.Op.String()
+}
+
+// upload sends the local file at rel to Drive as a new file, checks Drive's
+// checksum against the local one and records the result. track receives
+// bytes sent.
 func (s *run) upload(rel string, track func(int64)) (int64, error) {
 	abs := s.abs(rel)
 	before, err := os.Stat(abs)
@@ -376,6 +510,47 @@ func (s *run) upload(rel string, track func(int64)) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return s.uploaded(rel, abs, before, sum, f)
+}
+
+// update replaces the content of the Drive file id with the local file at
+// rel, keeping its ID and version history. If Drive's copy changed since the
+// last sync, nothing is overwritten: an edit there becomes a conflict that
+// keeps both, and a delete there loses to the edit here, which is uploaded
+// as a new file. It returns what it ended up doing.
+func (s *run) update(rel, id string, track func(int64)) (int64, reconcile.Op, error) {
+	base, _, err := s.db.Get(s.ctx, s.opt.Root, rel)
+	if err != nil {
+		return 0, reconcile.Upload, err
+	}
+	abs := s.abs(rel)
+	before, err := os.Stat(abs)
+	if err != nil {
+		return 0, reconcile.Upload, err
+	}
+	sum, err := localfs.MD5File(abs)
+	if err != nil {
+		return 0, reconcile.Upload, err
+	}
+	f, err := s.r.Update(s.ctx, id, abs, before.ModTime(), sum, base.MD5, track)
+	switch {
+	case errors.Is(err, gdrive.ErrChanged) && f.Trashed:
+		n, err := s.upload(rel, track)
+		return n, reconcile.Upload, err
+	case errors.Is(err, gdrive.ErrChanged):
+		f.Rel = rel
+		n, err := s.conflict(rel, f, track)
+		return n, reconcile.Conflict, err
+	case err != nil:
+		return 0, reconcile.Upload, err
+	}
+	n, err := s.uploaded(rel, abs, before, sum, f)
+	return n, reconcile.Upload, err
+}
+
+// uploaded checks a finished upload of the local file abs, as it was before
+// the upload, and records it.
+func (s *run) uploaded(rel, abs string, before fs.FileInfo, sum string, f gdrive.File) (int64, error) {
 	if f.MD5 != "" && f.MD5 != sum {
 		return 0, fmt.Errorf("Drive's checksum %s does not match the local %s", f.MD5, sum)
 	}
@@ -392,17 +567,108 @@ func (s *run) upload(rel string, track func(int64)) (int64, error) {
 	})
 }
 
-// download fetches the Drive file at rel into a temporary file, verifies its
-// checksum, sets its modified time and only then moves it into place. track
-// receives bytes received.
-func (s *run) download(rel string, track func(int64)) (int64, error) {
-	rf, ok := s.remote[rel]
-	if !ok {
+// unchanged reports whether the local file fi is still as the scan saw it.
+func (s *run) unchanged(rel string, fi fs.FileInfo) bool {
+	lf, ok := s.local[rel]
+	return ok && fi.Mode().IsRegular() && fi.Size() == lf.Size && fi.ModTime().Equal(lf.ModTime)
+}
+
+// trashLocal moves the local file at rel to the OS trash, unless it was
+// edited after the scan: then it stays, and the next run uploads it.
+func (s *run) trashLocal(rel string) error {
+	abs := s.abs(rel)
+	fi, err := os.Lstat(abs)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return s.db.Delete(s.ctx, s.opt.Root, rel) // already gone
+	case err != nil:
+		return err
+	case !s.unchanged(rel, fi):
+		return errors.New("edited here after the scan; kept, and the next sync uploads it")
+	}
+	if err := s.opt.Trash(abs); err != nil {
+		return err
+	}
+	return s.db.Delete(s.ctx, s.opt.Root, rel)
+}
+
+// trashRemote moves the Drive file id to Drive's trash.
+func (s *run) trashRemote(rel, id string) error {
+	if err := s.r.Trash(s.ctx, id); err != nil {
+		return err
+	}
+	return s.db.Delete(s.ctx, s.opt.Root, rel)
+}
+
+// removeFolders removes the folders in dirs that are empty now that their
+// files are gone, deepest first: here with a plain remove, which only works
+// on an empty folder, and in Drive after checking it holds nothing at all.
+// A folder that still holds something, such as ignored files or Google Docs,
+// stays where it is, and so does its record.
+func (s *run) removeFolders(dirs []reconcile.Action) {
+	slices.SortFunc(dirs, func(a, b reconcile.Action) int {
+		return cmp.Or(cmp.Compare(strings.Count(b.Rel, "/"), strings.Count(a.Rel, "/")), cmp.Compare(a.Rel, b.Rel))
+	})
+	fail := func(rel string, err error) {
+		s.res.Failed = append(s.res.Failed, filter.Issue{Rel: rel + "/", Reason: err.Error()})
+		fmt.Fprintf(s.opt.Log, "FAILED remove folder %s: %v\n", rel, err)
+	}
+	keep := func(rel, where string) {
+		fmt.Fprintf(s.opt.Log, "kept      %s/ (deleted on the other side, but still holds files CloudSync doesn't sync %s)\n", rel, where)
+	}
+	for _, a := range dirs {
+		switch a.Op {
+		case reconcile.TrashLocal:
+			abs := s.abs(a.Rel)
+			if entries, err := os.ReadDir(abs); err == nil && len(entries) > 0 {
+				keep(a.Rel, "here")
+				continue
+			}
+			if err := os.Remove(abs); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				fail(a.Rel, err)
+				continue
+			}
+		case reconcile.TrashRemote:
+			has, err := s.r.HasChildren(s.ctx, a.DriveID)
+			if err != nil {
+				fail(a.Rel, err)
+				continue
+			}
+			if has {
+				keep(a.Rel, "in Drive")
+				continue
+			}
+			if err := s.r.Trash(s.ctx, a.DriveID); err != nil {
+				fail(a.Rel, err)
+				continue
+			}
+		}
+		if err := s.db.Delete(s.ctx, s.opt.Root, a.Rel); err != nil {
+			fail(a.Rel, err)
+			continue
+		}
+		s.res.FoldersRemoved++
+		fmt.Fprintf(s.opt.Log, "removed   %s/\n", a.Rel)
+	}
+}
+
+// download fetches the Drive file rf into a temporary file next to rel,
+// verifies its checksum, sets its modified time and only then moves it into
+// place. It replaces a local file only if that file is still exactly as the
+// scan saw it, so nothing written since is lost. track receives bytes
+// received.
+func (s *run) download(rel string, rf gdrive.File, track func(int64)) (int64, error) {
+	if rf.ID == "" {
 		return 0, fmt.Errorf("%s is not in the Drive listing", rel)
 	}
 	abs := s.abs(rel)
-	if _, err := os.Lstat(abs); err == nil {
-		return 0, errors.New("a local file now exists at this path; both copies were left untouched")
+	if fi, err := os.Lstat(abs); err == nil {
+		if _, scanned := s.local[rel]; !scanned {
+			return 0, errors.New("a local file now exists at this path; both copies were left untouched")
+		}
+		if !s.unchanged(rel, fi) {
+			return 0, errors.New("edited here after the scan; both copies were left untouched for the next sync")
+		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return 0, err
 	}
@@ -469,13 +735,13 @@ func (c *counter) Write(p []byte) (int, error) {
 }
 
 // conflict keeps both versions: the local file is renamed to a conflict copy
-// and uploaded, and Drive's version is downloaded under the original name.
-func (s *run) conflict(it plan.Item, track func(int64)) (int64, error) {
-	copyRel := s.copies[it.Rel]
-	if err := os.Rename(s.abs(it.Rel), s.abs(copyRel)); err != nil {
+// and uploaded, and Drive's version rf is downloaded under the original name.
+func (s *run) conflict(rel string, rf gdrive.File, track func(int64)) (int64, error) {
+	copyRel := s.copyName(rel)
+	if err := os.Rename(s.abs(rel), s.abs(copyRel)); err != nil {
 		return 0, err
 	}
-	down, err := s.download(it.Rel, track)
+	down, err := s.download(rel, rf, track)
 	if err != nil {
 		return 0, fmt.Errorf("your version was kept as %s, but downloading Drive's version failed: %w", copyRel, err)
 	}
@@ -484,6 +750,20 @@ func (s *run) conflict(it plan.Item, track func(int64)) (int64, error) {
 		return down, fmt.Errorf("Drive's version was downloaded; uploading your copy %s failed: %w", copyRel, err)
 	}
 	return down + up, nil
+}
+
+// copyName returns the conflict copy's name for rel: the one chosen before
+// transfers started, or, for a conflict found during one, a new one.
+func (s *run) copyName(rel string) string {
+	s.namesMu.Lock()
+	defer s.namesMu.Unlock()
+	if c, ok := s.copies[rel]; ok {
+		return c
+	}
+	c := s.conflictName(rel)
+	s.opt.Names.Assign(c)
+	s.copies[rel] = c
+	return c
 }
 
 // conflictName returns a free name like "notes (conflict Windows 2026-10-27 1432).pdf".

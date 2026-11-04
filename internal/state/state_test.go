@@ -180,3 +180,33 @@ func TestDeleteLog(t *testing.T) {
 		t.Errorf("DeleteLog = %+v\nwant %+v and %+v", got, auto, held)
 	}
 }
+
+func TestItemsAndDelete(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	for _, it := range []Item{
+		{Root: "MyFiles", Rel: "b.txt", DriveID: "B", Size: 2, MD5: "bb"},
+		{Root: "MyFiles", Rel: "a", DriveID: "A", IsDir: true},
+		{Root: "Other", Rel: "c.txt", DriveID: "C"},
+	} {
+		if err := db.Put(ctx, it); err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := db.Items(ctx, "MyFiles")
+	if err != nil || len(items) != 2 || items[0].Rel != "a" || !items[0].IsDir || items[1].MD5 != "bb" {
+		t.Fatalf("Items = %+v, %v", items, err)
+	}
+	if err := db.Delete(ctx, "MyFiles", "b.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(ctx, "MyFiles", "never-there"); err != nil {
+		t.Errorf("deleting a missing item: %v", err)
+	}
+	if _, ok, _ := db.Get(ctx, "MyFiles", "b.txt"); ok {
+		t.Error("b.txt is still recorded")
+	}
+	if _, ok, _ := db.Get(ctx, "Other", "c.txt"); !ok {
+		t.Error("Delete touched another root")
+	}
+}

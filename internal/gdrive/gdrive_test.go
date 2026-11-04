@@ -8,9 +8,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
@@ -242,5 +245,104 @@ func TestCreateFolderLostReply(t *testing.T) {
 	}
 	if s.creates != 1 || len(s.names) != 1 {
 		t.Errorf("Drive has %v after %d creates; the retry made a duplicate", s.names, s.creates)
+	}
+}
+
+// fileServer is a fake Drive API holding one file, "x". Updates set its
+// checksum to newMD5; gone makes every request answer 404.
+type fileServer struct {
+	mu              sync.Mutex
+	md5             string
+	newMD5          string
+	trashed, gone   bool
+	updates, trashs int
+}
+
+func (s *fileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if s.gone {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"error":{"code":404,"message":"File not found: x."}}`)
+		return
+	}
+	switch {
+	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/upload/"):
+		s.updates++
+		s.md5 = s.newMD5
+	case r.Method == http.MethodPatch:
+		var f struct{ Trashed bool }
+		json.NewDecoder(r.Body).Decode(&f)
+		s.trashed = s.trashed || f.Trashed
+		s.trashs++
+	}
+	fmt.Fprintf(w, `{"id":"x","name":"a.txt","md5Checksum":%q,"trashed":%v}`, s.md5, s.trashed)
+}
+
+func fileClient(t *testing.T, s *fileServer) *Client {
+	t.Helper()
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+	srv, err := drive.NewService(context.Background(), option.WithHTTPClient(ts.Client()), option.WithEndpoint(ts.URL+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Client{srv: srv}
+}
+
+func TestUpdate(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "a.txt")
+	if err := os.WriteFile(local, []byte("edited here"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	update := func(s *fileServer) (File, error) {
+		return fileClient(t, s).Update(ctx, "x", local, time.Now(), "new", "old", nil)
+	}
+
+	t.Run("unchanged in Drive", func(t *testing.T) {
+		s := &fileServer{md5: "old", newMD5: "new"}
+		f, err := update(s)
+		if err != nil || s.updates != 1 || f.MD5 != "new" || f.ID != "x" {
+			t.Errorf("Update = %+v, %v after %d updates; want one update", f, err, s.updates)
+		}
+	})
+	t.Run("already updated by an earlier attempt", func(t *testing.T) {
+		s := &fileServer{md5: "new"}
+		if _, err := update(s); err != nil || s.updates != 0 {
+			t.Errorf("err = %v after %d updates; want done without uploading", err, s.updates)
+		}
+	})
+	t.Run("edited elsewhere", func(t *testing.T) {
+		s := &fileServer{md5: "phone edit", newMD5: "new"}
+		f, err := update(s)
+		if !errors.Is(err, ErrChanged) || s.updates != 0 || f.MD5 != "phone edit" {
+			t.Errorf("Update = %+v, %v after %d updates; want ErrChanged and Drive's copy untouched", f, err, s.updates)
+		}
+	})
+	t.Run("trashed elsewhere", func(t *testing.T) {
+		s := &fileServer{md5: "old", trashed: true}
+		f, err := update(s)
+		if !errors.Is(err, ErrChanged) || !f.Trashed || s.updates != 0 {
+			t.Errorf("Update = %+v, %v; want ErrChanged with Trashed", f, err)
+		}
+	})
+	t.Run("deleted elsewhere", func(t *testing.T) {
+		f, err := update(&fileServer{gone: true})
+		if !errors.Is(err, ErrChanged) || !f.Trashed {
+			t.Errorf("Update = %+v, %v; want ErrChanged with Trashed", f, err)
+		}
+	})
+}
+
+func TestTrash(t *testing.T) {
+	ctx := context.Background()
+	s := &fileServer{}
+	if err := fileClient(t, s).Trash(ctx, "x"); err != nil || !s.trashed {
+		t.Errorf("Trash: err = %v, trashed = %v", err, s.trashed)
+	}
+	if err := fileClient(t, &fileServer{gone: true}).Trash(ctx, "x"); err != nil {
+		t.Errorf("Trash of a file that is already gone: %v", err)
 	}
 }
