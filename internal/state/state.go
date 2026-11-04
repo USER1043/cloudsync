@@ -15,6 +15,8 @@ import (
 
 // schemaVersion 2 added items.local_name. A CloudSync that knows only
 // version 1 refuses the database rather than ignore the stand-in names.
+// The delete_log table was added later without a new version: older builds
+// never read it, so they can safely ignore it.
 const schemaVersion = 2
 
 const schema = `
@@ -33,6 +35,18 @@ CREATE TABLE IF NOT EXISTS items (
 	synced_at   INTEGER NOT NULL,
 	local_name  TEXT    NOT NULL DEFAULT '',
 	PRIMARY KEY (root, rel)
+);
+CREATE TABLE IF NOT EXISTS delete_log (
+	id         INTEGER PRIMARY KEY,
+	at         INTEGER NOT NULL,
+	root       TEXT    NOT NULL,
+	os         TEXT    NOT NULL,
+	files      INTEGER NOT NULL,
+	local      INTEGER NOT NULL,
+	remote     INTEGER NOT NULL,
+	held       INTEGER NOT NULL,
+	decision   TEXT    NOT NULL,
+	decided_at INTEGER NOT NULL DEFAULT 0
 );`
 
 // migrations[v] upgrades a database from schema v to v+1.
@@ -182,4 +196,80 @@ func (d *DB) SetMeta(ctx context.Context, key, value string) error {
 		INSERT INTO meta (key, value) VALUES (?, ?)
 		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
+}
+
+// Decisions recorded in the delete log.
+const (
+	DeletesAuto      = "auto"      // under the guard's threshold; went ahead
+	DeletesPending   = "pending"   // held; waiting for the owner
+	DeletesApproved  = "approved"  // held, then approved by the owner
+	DeletesCancelled = "cancelled" // held, then cancelled; the files were restored
+)
+
+// DeleteEvent is one run's deletes, logged so the big-delete guard's
+// threshold can be tuned from real use.
+type DeleteEvent struct {
+	ID        int64
+	At        int64 // unix seconds
+	Root      string
+	OS        string // "Linux" or "Windows"
+	Files     int    // files in the root at the last sync
+	Local     int    // files to trash here
+	Remote    int    // files to trash in Drive
+	Held      bool   // the guard asked the owner
+	Decision  string // one of the Deletes* constants
+	DecidedAt int64  // unix seconds; 0 while pending
+}
+
+// LogDeletes records ev and returns its ID.
+func (d *DB) LogDeletes(ctx context.Context, ev DeleteEvent) (int64, error) {
+	held := 0
+	if ev.Held {
+		held = 1
+	}
+	res, err := d.db.ExecContext(ctx, `
+		INSERT INTO delete_log (at, root, os, files, local, remote, held, decision, decided_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ev.At, ev.Root, ev.OS, ev.Files, ev.Local, ev.Remote, held, ev.Decision, ev.DecidedAt)
+	if err != nil {
+		return 0, fmt.Errorf("logging deletes: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// DecideDeletes records the owner's answer to a held event.
+func (d *DB) DecideDeletes(ctx context.Context, id int64, decision string, at int64) error {
+	res, err := d.db.ExecContext(ctx, `
+		UPDATE delete_log SET decision = ?, decided_at = ? WHERE id = ? AND decision = ?`,
+		decision, at, id, DeletesPending)
+	if err != nil {
+		return fmt.Errorf("logging the delete decision: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("no pending deletes with ID %d", id)
+	}
+	return nil
+}
+
+// DeleteLog returns root's delete log, oldest first.
+func (d *DB) DeleteLog(ctx context.Context, root string) ([]DeleteEvent, error) {
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT id, at, root, os, files, local, remote, held, decision, decided_at
+		FROM delete_log WHERE root = ? ORDER BY id`, root)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []DeleteEvent
+	for rows.Next() {
+		var ev DeleteEvent
+		var held int
+		if err := rows.Scan(&ev.ID, &ev.At, &ev.Root, &ev.OS, &ev.Files, &ev.Local, &ev.Remote,
+			&held, &ev.Decision, &ev.DecidedAt); err != nil {
+			return nil, err
+		}
+		ev.Held = held != 0
+		out = append(out, ev)
+	}
+	return out, rows.Err()
 }

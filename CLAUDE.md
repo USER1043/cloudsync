@@ -67,7 +67,7 @@ design for that limit, including quota checks.
 | Windows-name translation (`internal/winname`, `ISSUES.md` #1, #2) | done on Linux; verify on Windows |
 | Fedora first sync of `~/My_Files` | **done and verified** 2026-10-28: nothing failed; re-plan shows 1,341 files in sync, 0 to transfer |
 | Faster uploads (`ISSUES.md` #5) | **done** 2026-11-03: test sync of 52 folders + 73 files went from 122 s to 33 s |
-| 3: continuous two-way sync daemon (background service) | **next** |
+| 3: continuous two-way sync daemon (background service) | **in progress**: reconciler, big-delete guard and delete log done (`internal/reconcile`, `state.delete_log`) |
 
 After a root's first sync, `cloudsync sync` only reports "already completed".
 Until Phase 3, later edits don't sync, and files coming from Fedora reach
@@ -87,11 +87,13 @@ out of this file (they are in Claude's private project memory instead).
   `client_secret*.json`, recovery-code files). It syncs, so Windows gets the
   same rules. Fedora's `config.toml` also ignores two large, re-downloadable
   folders (model weights, a competition dataset).
-- **Windows follow-up:** `C:\MyFiles` still has the old layout and its state
-  DB records old paths. Rebuild there first (state schema v2), then either
-  let Phase 3 catch up or reset (rename `C:\MyFiles` to `C:\MyFiles.old`,
-  fresh state, first sync downloads everything, check `.old`, delete it).
-  Decide with the owner.
+- **Windows follow-up (decided 2026-11-05: Phase 3 catches it up):**
+  `C:\MyFiles` still has the old layout and its state DB records old paths.
+  Rebuild there (state schema v2) and let `cloudsync run` reconcile. Without
+  rename detection every moved file looks like "deleted at the old path, new
+  at the new path", so Windows downloads the new paths (~377 MB), trashes the
+  old copies to the Recycle Bin, and the big-delete guard pauses once for the
+  owner to approve.
 
 ## Next steps (in this order; discuss design with the owner before coding)
 
@@ -159,7 +161,8 @@ Packages:
 | `internal/localfs` | `Scan`: walks a root, skips repos, applies rules, flags issues, reports true paths through a `winname.Map`; `MD5File` |
 | `internal/plan` | `FirstSync`: pure union-merge planner; exact path matching |
 | `internal/engine` | Carries out a plan: folders a depth at a time (each depth in parallel; `CreateFolder` skips the lookup inside folders made in the same run), then 8 parallel transfers, largest first, MD5-verified, atomic downloads (`.name.cloudsync-partial` then rename), keep-both conflicts, progress callbacks |
-| `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`) |
+| `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`); `delete_log` (each run's deletes, root size, whether the guard held them and the owner's answer) |
+| `internal/reconcile` | Phase 3 planner: `Reconcile`, a pure three-way comparison of scan, Drive tree and base (state DB) into actions (upload, download, trash here or in Drive, conflict, folders, record, forget, wait); `Skip` keeps paths missing for other reasons (too large, unreadable, repos) from being trashed. `Guard` interface with `DefaultGuard` (more than 50 files or 10%), `SplitDeletes` and `Undo` for held deletes |
 
 **The root name is the state DB key; never rename the `MyFiles` root.** The
 Drive change-feed start token is saved before the first sync touches
@@ -185,7 +188,34 @@ solved entries. The repo is public: no real file names from the synced folder.
   `CLOUDSYNC_STATE_DIR` pointing at a scratch config, state folder and Drive
   folder (e.g. `CloudSync-Test/...`). Never test against `CloudSync/MyFiles`.
 
-## Phase 3 plan (agreed outline; discuss details with the owner before coding)
+## Phase 3 plan (outline agreed; details below decided 2026-11-05)
+
+Decided with the owner on 2026-11-05:
+
+- **Build for Fedora and Windows together.**
+- **Drive is checked once per boot** (when `cloudsync run` starts), and when
+  the owner runs `cloudsync sync` by hand. There is no periodic Drive poll:
+  phone edits arrive at the next boot.
+- **Local edits upload live,** a few seconds after they settle, plus a final
+  flush at shutdown.
+- **Big-delete guard:** hold all deletes of a run, and ask, when it would
+  trash **more than 50 files or more than 10% of the root's files**. The
+  numbers are a starting guess: the guard is a pluggable policy, and every
+  run's delete count, the root's size and the owner's answer (approved or
+  cancelled) are logged in the state DB, so the threshold can be tuned from
+  real use and, later, worked out by the app itself. Design that adaptive
+  policy with the owner once there is data; it must never loosen the guard
+  silently.
+- **Errors explain themselves:** each failure to reach Drive gets a message
+  with its cause and fix. Offline: changes queue and retry when the network
+  is back. Sign-in expired or revoked: "run `cloudsync login`". Drive full:
+  pause uploads and say which services share the 15 GB. Root folder trashed
+  or missing in Drive: stop and say so, never re-upload blindly. Rate limits:
+  silent backoff. Repeated Google server errors: flag "Google Drive is having
+  problems, not your setup" with a link to Google's status page, and retry
+  later.
+
+Outline:
 
 - **`cloudsync run` daemon,** started at login: a systemd **user** unit on
   Fedora, and a Task Scheduler "at logon" task on Windows (not a Session-0
@@ -200,8 +230,8 @@ solved entries. The repo is public: no real file names from the synced folder.
   conflict, and an edit beats a delete. Big-delete guard and dry run. Test it
   with a table of cases.
 - **Live mode:** fsnotify with about 3 s debounce and a stable-size check;
-  a full rescan hourly and on watcher overflow; poll the Drive change feed
-  every 1–2 min (phone edits).
+  a full local rescan hourly and on watcher overflow. Drive is not polled
+  (see above).
 - **Shutdown:** on Linux, a logind inhibitor in "block" mode (D-Bus
   `org.freedesktop.login1.Manager.Inhibit`) held only while uploads are
   pending, which KDE shows in its logout screen, plus a flush in `ExecStop`.

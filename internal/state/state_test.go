@@ -147,3 +147,36 @@ func TestUpgradeFromSchema1(t *testing.T) {
 		t.Errorf("user_version = %d, want %d", v, schemaVersion)
 	}
 }
+
+func TestDeleteLog(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	auto := DeleteEvent{At: 100, Root: "MyFiles", OS: "Linux", Files: 1341, Local: 2, Decision: DeletesAuto}
+	if _, err := db.LogDeletes(ctx, auto); err != nil {
+		t.Fatal(err)
+	}
+	held := DeleteEvent{At: 200, Root: "MyFiles", OS: "Windows", Files: 1341, Local: 340, Held: true, Decision: DeletesPending}
+	id, err := db.LogDeletes(ctx, held)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.LogDeletes(ctx, DeleteEvent{At: 300, Root: "Other", OS: "Linux", Decision: DeletesAuto}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DecideDeletes(ctx, id, DeletesApproved, 250); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DecideDeletes(ctx, id, DeletesCancelled, 260); err == nil {
+		t.Error("deciding an already decided event should fail")
+	}
+
+	got, err := db.DeleteLog(ctx, "MyFiles")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auto.ID, held.ID = got[0].ID, id
+	held.Decision, held.DecidedAt = DeletesApproved, 250
+	if len(got) != 2 || got[0] != auto || got[1] != held {
+		t.Errorf("DeleteLog = %+v\nwant %+v and %+v", got, auto, held)
+	}
+}
