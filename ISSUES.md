@@ -13,7 +13,7 @@ small uploads, Windows locking the running `.exe`) are recorded in
 |---|---|---|
 | 1 | Names that Windows can't store are skipped | fixed; Windows side to verify |
 | 2 | Names that differ only in case are skipped | fixed; Windows side to verify |
-| 3 | Fedora's Go is older than `go.mod` requires | worked around |
+| 3 | Fedora's Go is older than `go.mod` requires | fixed |
 | 4 | `client_secret.json` can be world-readable after copying | open |
 | 5 | Uploads slower than the connection allows | fixed |
 
@@ -103,8 +103,10 @@ small uploads, Windows locking the running `.exe`) are recorded in
 - **Workaround:** prefix commands with `GOTOOLCHAIN=go1.27.3` (Go downloads
   the official, checksum-verified toolchain into its cache), or run
   `go env -w GOTOOLCHAIN=auto` once. All tests pass with 1.27.3 on Linux.
-- **Solved when:** Fedora ships Go ≥ 1.27.3, or we decide to lower the `go`
-  line in `go.mod`.
+- **Fix (2026-11-05):** ran `go env -w GOTOOLCHAIN=auto` once. Fedora's Go
+  now switches to the version `go.mod` asks for (1.27.3, also the latest
+  release), so plain `go build` and `go test` work with no prefix. On a
+  fresh Fedora machine, run the same command before the first build.
 
 ## 4. `client_secret.json` can be world-readable after copying
 

@@ -145,7 +145,8 @@ out of this file (they are in Claude's private project memory instead).
 ## Architecture
 
 Go 1.27.3 (`go.mod`), no CGO (cross-compiles with `GOOS=linux`). On Fedora,
-see `ISSUES.md` #3 for the toolchain workaround. Packages:
+run `go env -w GOTOOLCHAIN=auto` once so Go fetches 1.27.3 (`ISSUES.md` #3).
+Packages:
 
 | Package | Role |
 |---|---|
