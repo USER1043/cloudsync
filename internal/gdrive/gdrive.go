@@ -171,16 +171,32 @@ func (c *Client) EnsurePath(ctx context.Context, segments []string) (string, err
 // EnsureFolder returns the ID of the folder called name inside parentID,
 // creating it if needed.
 func (c *Client) EnsureFolder(ctx context.Context, parentID, name string) (string, error) {
+	return c.folder(ctx, parentID, name, true)
+}
+
+// CreateFolder is EnsureFolder for a parent known to have no folder called
+// name, such as one created moments ago: it saves the lookup, one request
+// in two. Retries still look first, so a create that went through but whose
+// reply was lost is not made twice.
+func (c *Client) CreateFolder(ctx context.Context, parentID, name string) (string, error) {
+	return c.folder(ctx, parentID, name, false)
+}
+
+func (c *Client) folder(ctx context.Context, parentID, name string, lookFirst bool) (string, error) {
 	var id string
+	attempt := 0
 	err := Retry(ctx, func() error {
-		// Looking first also covers a retry after a create whose reply was lost.
-		f, err := c.findChild(ctx, parentID, name, true)
-		if err != nil {
-			return err
-		}
-		if f != nil {
-			id = f.ID
-			return nil
+		attempt++
+		// Looking also covers a retry after a create whose reply was lost.
+		if lookFirst || attempt > 1 {
+			f, err := c.findChild(ctx, parentID, name, true)
+			if err != nil {
+				return err
+			}
+			if f != nil {
+				id = f.ID
+				return nil
+			}
 		}
 		nf, err := c.srv.Files.Create(&drive.File{Name: name, MimeType: folderMime, Parents: []string{parentID}}).
 			Fields("id").Context(ctx).Do()

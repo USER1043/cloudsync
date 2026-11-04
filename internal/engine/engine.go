@@ -2,6 +2,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -30,6 +31,7 @@ import (
 // implements it.
 type Remote interface {
 	EnsureFolder(ctx context.Context, parentID, name string) (string, error)
+	CreateFolder(ctx context.Context, parentID, name string) (string, error)
 	Upload(ctx context.Context, parentID, name, localPath string, modTime time.Time, md5sum string, progress func(sent int64)) (gdrive.File, error)
 	Download(ctx context.Context, id string, w io.Writer) error
 }
@@ -40,7 +42,7 @@ type Options struct {
 	Local   string    // local folder
 	RootID  string    // Drive folder ID of the root
 	Label   string    // OS name used in conflict copy names, e.g. "Windows"
-	Workers int       // parallel transfers; 4 if zero
+	Workers int       // parallel transfers and folder creations; 8 if zero
 	Log     io.Writer // one line per folder created and per transfer
 
 	// Names holds the stand-in names this computer uses (Windows only; nil
@@ -77,7 +79,10 @@ type Result struct {
 // cannot go on at all; individual file failures are listed in the Result.
 func FirstSync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan) (*Result, error) {
 	if opt.Workers <= 0 {
-		opt.Workers = 4
+		// Large files are limited by the uplink, which one transfer nearly
+		// fills; small files by about 2 s per request, which more parallel
+		// requests hide, up to Google's per-user write limit.
+		opt.Workers = 8
 	}
 	if opt.Log == nil {
 		opt.Log = io.Discard
@@ -123,6 +128,9 @@ func FirstSync(ctx context.Context, r Remote, db *state.DB, opt Options, scan *l
 		jobs = append(jobs, it)
 		s.totalBytes += it.Size
 	}
+	// Largest first, so big files run while small ones fill the gaps rather
+	// than one big file running alone at the end.
+	slices.SortStableFunc(jobs, func(a, b plan.Item) int { return cmp.Compare(b.Size, a.Size) })
 	s.total = len(jobs)
 	s.report()
 
@@ -217,23 +225,26 @@ func (s *run) makeFolders(scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan)
 			}
 		}
 	}
-	rels := make([]string, 0, len(need))
+	// Create the missing Drive folders a depth at a time, the folders of each
+	// depth in parallel. Nothing can exist yet inside a folder created in this
+	// run, so its subfolders skip the lookup.
+	var levels [][]string
 	for rel := range need {
-		rels = append(rels, rel)
-	}
-	sort.Strings(rels) // a parent is a prefix of its children, so it sorts first
-	for _, rel := range rels {
 		if _, ok := s.folders[rel]; ok {
 			continue
 		}
-		parent, name := splitRel(rel)
-		id, err := s.r.EnsureFolder(s.ctx, s.folders[parent], name)
-		if err != nil {
+		depth := strings.Count(rel, "/")
+		for len(levels) <= depth {
+			levels = append(levels, nil)
+		}
+		levels[depth] = append(levels[depth], rel)
+	}
+	created := make(map[string]bool)
+	for _, level := range levels {
+		sort.Strings(level)
+		if err := s.createFolders(level, created); err != nil {
 			return err
 		}
-		s.folders[rel] = id
-		s.res.Folders++
-		fmt.Fprintf(s.opt.Log, "folder    %s\n", rel)
 	}
 
 	local := slices.Clone(tree.Folders)
@@ -251,6 +262,41 @@ func (s *run) makeFolders(scan *localfs.Result, tree *gdrive.Tree, p *plan.Plan)
 		if err := s.record(state.Item{Root: s.opt.Root, Rel: rel, DriveID: id, IsDir: true, SyncedAt: s.now.Unix()}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// createFolders creates the Drive folders rels, whose parents all exist
+// already, opt.Workers at a time. It records them in s.folders and in
+// created, the folders made in this run.
+func (s *run) createFolders(rels []string, created map[string]bool) error {
+	ids := make([]string, len(rels))
+	errs := make([]error, len(rels))
+	sem := make(chan struct{}, s.opt.Workers)
+	var wg sync.WaitGroup
+	for i, rel := range rels {
+		parent, name := splitRel(rel)
+		create := s.r.EnsureFolder
+		if created[parent] {
+			create = s.r.CreateFolder
+		}
+		parentID := s.folders[parent]
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			ids[i], errs[i] = create(s.ctx, parentID, name)
+		}()
+	}
+	wg.Wait()
+	for i, rel := range rels {
+		if errs[i] != nil {
+			return errs[i]
+		}
+		s.folders[rel] = ids[i]
+		created[rel] = true
+		s.res.Folders++
+		fmt.Fprintf(s.opt.Log, "folder    %s\n", rel)
 	}
 	return nil
 }

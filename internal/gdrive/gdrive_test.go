@@ -2,15 +2,19 @@ package gdrive
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
+	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 
 	"github.com/USER1043/cloudsync/internal/filter"
 )
@@ -160,5 +164,83 @@ func TestJoinRel(t *testing.T) {
 	}
 	if got := joinRel("Sem5/DBMS", "a.pdf"); got != "Sem5/DBMS/a.pdf" {
 		t.Errorf("joinRel nested = %q", got)
+	}
+}
+
+// folderServer is a fake Drive API that holds folders. With loseReply set,
+// the first create goes through but answers 503, like a reply lost on the way.
+type folderServer struct {
+	mu             sync.Mutex
+	names          []string
+	lists, creates int
+	loseReply      bool
+}
+
+func (s *folderServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	switch r.Method {
+	case http.MethodGet:
+		s.lists++
+		var files []string
+		for i, n := range s.names {
+			files = append(files, fmt.Sprintf(`{"id":"f%d","name":%q,"mimeType":%q}`, i, n, folderMime))
+		}
+		fmt.Fprintf(w, `{"files":[%s]}`, strings.Join(files, ","))
+	case http.MethodPost:
+		s.creates++
+		var f struct{ Name string }
+		json.NewDecoder(r.Body).Decode(&f)
+		s.names = append(s.names, f.Name)
+		if s.loseReply {
+			s.loseReply = false
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"error":{"code":503,"message":"backend error"}}`)
+			return
+		}
+		fmt.Fprintf(w, `{"id":"f%d"}`, len(s.names)-1)
+	}
+}
+
+func folderClient(t *testing.T, s *folderServer) *Client {
+	t.Helper()
+	ts := httptest.NewServer(s)
+	t.Cleanup(ts.Close)
+	srv, err := drive.NewService(context.Background(), option.WithHTTPClient(ts.Client()), option.WithEndpoint(ts.URL+"/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Client{srv: srv}
+}
+
+func TestCreateFolderSkipsLookup(t *testing.T) {
+	ctx := context.Background()
+	s := &folderServer{}
+	c := folderClient(t, s)
+	if id, err := c.CreateFolder(ctx, "p", "Sem5"); err != nil || id != "f0" {
+		t.Fatalf("CreateFolder = %q, %v", id, err)
+	}
+	if s.lists != 0 || s.creates != 1 {
+		t.Errorf("CreateFolder made %d lookups and %d creates, want 0 and 1", s.lists, s.creates)
+	}
+	if id, err := c.EnsureFolder(ctx, "p", "Sem5"); err != nil || id != "f0" || s.lists != 1 || s.creates != 1 {
+		t.Errorf("EnsureFolder of an existing folder = %q, %v with %d lookups, %d creates; want f0 found by one lookup",
+			id, err, s.lists, s.creates)
+	}
+}
+
+func TestCreateFolderLostReply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for backoff")
+	}
+	s := &folderServer{loseReply: true}
+	c := folderClient(t, s)
+	id, err := c.CreateFolder(context.Background(), "p", "Sem5")
+	if err != nil || id != "f0" {
+		t.Fatalf("CreateFolder = %q, %v; want the folder the lost reply was for", id, err)
+	}
+	if s.creates != 1 || len(s.names) != 1 {
+		t.Errorf("Drive has %v after %d creates; the retry made a duplicate", s.names, s.creates)
 	}
 }

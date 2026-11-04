@@ -15,6 +15,7 @@ small uploads, Windows locking the running `.exe`) are recorded in
 | 2 | Names that differ only in case are skipped | fixed; Windows side to verify |
 | 3 | Fedora's Go is older than `go.mod` requires | worked around |
 | 4 | `client_secret.json` can be world-readable after copying | open |
+| 5 | Uploads slower than the connection allows | fixed |
 
 ## 1. Names that Windows can't store are skipped
 
@@ -113,3 +114,32 @@ small uploads, Windows locking the running `.exe`) are recorded in
 - **Cause:** CloudSync never checks the file's permissions.
 - **Possible fix:** on Unix, have `login` warn about (or tighten) a
   `client_secret.json` that group or others can read.
+
+## 5. Uploads slower than the connection allows
+
+- **Found:** 2026-10-28, after the Fedora first sync (1.6 GB up) felt slow.
+- **Measured** with a throwaway benchmark against `CloudSync-Test`: large
+  files are bound by the uplink (~18 Mbit/s for one transfer, ~21 for four
+  at once; chunk size made no measurable difference). Small files take
+  about 2 s per request (0.5 files/s one at a time, 2.5 with four, 3.65
+  with sixteen, apparently near Google's per-user write limit).
+- **Cause:** besides the uplink, which nothing can fix: folders were
+  created one at a time before any transfer, each with a lookup and a
+  create (two ~2 s requests); only four transfers ran at once, too few to
+  hide per-request latency; and files ran in plan order, so a big file
+  could end up running alone at the end.
+- **Fix (2026-11-03):**
+  - `gdrive.CreateFolder`: creates without the lookup, for a parent made
+    in the same run (it must be empty). A retry still looks first, so a
+    create whose reply was lost isn't made twice.
+  - The engine creates folders a depth at a time, each depth in parallel,
+    using `CreateFolder` under folders it just made.
+  - 8 parallel transfers by default instead of 4.
+  - Largest files first.
+- **Verified:** tests with the fake Drive (lookups skipped only under new
+  folders, no duplicates, largest-first order) and with a fake Drive HTTP
+  server (a lost create reply is retried without a duplicate); race
+  detector clean. Live against `CloudSync-Test`, the same tree of 52
+  folders and 73 files (72 × 4 KB, 1 × 16 MB) took **122 s with the old
+  build and 33 s with the new one**; a re-plan found all 73 in sync and no
+  duplicate folders.

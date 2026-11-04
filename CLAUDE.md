@@ -66,8 +66,8 @@ design for that limit, including quota checks.
 | Windows first sync of `C:\MyFiles` | **done and verified**: 629 files, 377.5 MB, all MD5-matched |
 | Windows-name translation (`internal/winname`, `ISSUES.md` #1, #2) | done on Linux; verify on Windows |
 | Fedora first sync of `~/My_Files` | **done and verified** 2026-10-28: nothing failed; re-plan shows 1,341 files in sync, 0 to transfer |
-| Faster large uploads | **next**, see "Next steps" |
-| 3: continuous two-way sync daemon (background service) | after that |
+| Faster uploads (`ISSUES.md` #5) | **done** 2026-11-03: test sync of 52 folders + 73 files went from 122 s to 33 s |
+| 3: continuous two-way sync daemon (background service) | **next** |
 
 After a root's first sync, `cloudsync sync` only reports "already completed".
 Until Phase 3, later edits don't sync, and files coming from Fedora reach
@@ -95,15 +95,34 @@ out of this file (they are in Claude's private project memory instead).
 
 ## Next steps (in this order; discuss design with the owner before coding)
 
-1. **Faster large uploads ("parallel push").** Today the engine runs 4
-   transfers at once (`engine.Options.Workers`) and uploads files over 8 MiB
-   in resumable chunks of 8 MiB (`gdrive.chunkSize`). Drive's resumable
-   protocol needs one file's chunks in order, so a single big file can't be
-   split across connections; the speed-ups are around it. Measure the
-   Fedora sync's throughput first, then consider: larger chunks (fewer
-   round trips, more memory per worker), a configurable worker count,
-   starting the largest files first so a 261 MB file doesn't run alone at
-   the end, and checking that the uplink, not CloudSync, is the limit.
+1. **Faster uploads (done 2026-11-03, `ISSUES.md` #5).** Measured
+   2026-10-28 on the owner's connection (throwaway benchmark against
+   `CloudSync-Test/UploadBench`, files deleted afterwards):
+
+   | Test | Result |
+   |---|---|
+   | 1 large file, 8 MB chunks | 18.3 Mbit/s |
+   | 4 large files in sequence, 32 MB chunks | 17.4 Mbit/s |
+   | 4 large files at once | 20.9 Mbit/s |
+   | 64 × 16 KB files, 1 / 4 / 16 at once | 0.5 / 2.5 / 3.65 files/s |
+
+   Conclusions: large files are bound by the ~20 Mbit/s uplink (one stream
+   nearly fills it; chunk size made no measurable difference). Small files
+   are bound by ~2 s per request, and parallelism helps up to ~3–4 files/s,
+   apparently Google's per-user write limit. Folders are created one at a
+   time before any transfer, two requests each (lookup + create), which costs
+   minutes on a first sync with hundreds of new folders.
+
+   Built (items 1–3; item 4 kept as is):
+   1. Faster folder creation: skip the lookup inside a folder created in the
+      same run (it's empty), and create folders of the same depth in
+      parallel. Must stay safe on retry.
+   2. 8 parallel transfers instead of 4 (`engine.Options.Workers`).
+   3. Start the largest files first, so big files overlap with small-file
+      latency instead of running alone at the end.
+   4. Leave `gdrive.chunkSize` at 8 MiB.
+
+   Not possible: going past the uplink.
 2. **Background service:** the Phase 3 `cloudsync run` daemon below
    (systemd user unit on Fedora, logon task on Windows).
 
@@ -133,12 +152,12 @@ see `ISSUES.md` #3 for the toolchain workaround. Packages:
 | `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`; terminal progress bar (`progress.go`) |
 | `internal/config` | `config.toml` load/write/validate, `ParseSize`, per-OS dirs. No built-in default root: a missing config returns `ErrNoConfig` |
 | `internal/auth` | OAuth loopback + PKCE, token in OS keyring, refreshed tokens saved back |
-| `internal/gdrive` | Drive v3: find/create folders, list trees, chunked resumable uploads, downloads, `Retry` (backoff on 429/5xx/rate-limit 403), `countingTransport` for upload progress, `Tree.Filter` |
+| `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, downloads, `Retry` (backoff on 429/5xx/rate-limit 403), `countingTransport` for upload progress, `Tree.Filter` |
 | `internal/filter` | gitignore-style `Matcher` (last match wins, `!`, anchored `/x/`, `**`, case-insensitive), `.cloudsyncignore`, size limit, `CheckName` for names no system can sync |
 | `internal/winname` | Windows stand-in names: `Encode` (pure), and `Map` (true path ↔ local name, case-insensitive taken names, `Found` for scans, `Assign` for new entries). A nil `*Map` is the identity, used on Linux |
 | `internal/localfs` | `Scan`: walks a root, skips repos, applies rules, flags issues, reports true paths through a `winname.Map`; `MD5File` |
 | `internal/plan` | `FirstSync`: pure union-merge planner; exact path matching |
-| `internal/engine` | Carries out a plan: folders first, then 4 parallel transfers, MD5-verified, atomic downloads (`.name.cloudsync-partial` then rename), keep-both conflicts, progress callbacks |
+| `internal/engine` | Carries out a plan: folders a depth at a time (each depth in parallel; `CreateFolder` skips the lookup inside folders made in the same run), then 8 parallel transfers, largest first, MD5-verified, atomic downloads (`.name.cloudsync-partial` then rename), keep-both conflicts, progress callbacks |
 | `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`) |
 
 **The root name is the state DB key; never rename the `MyFiles` root.** The

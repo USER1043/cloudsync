@@ -26,6 +26,10 @@ type fakeDrive struct {
 	mu    sync.Mutex
 	n     int
 	nodes map[string]*node
+
+	lookups, creates int      // folder requests, as the real Drive would see them
+	dupes            int      // CreateFolder calls where the folder already existed
+	uploads          []string // uploaded names, in the order they started
 }
 
 type node struct {
@@ -54,12 +58,31 @@ func (f *fakeDrive) add(n *node) string {
 func (f *fakeDrive) EnsureFolder(_ context.Context, parentID, name string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lookups++
+	if id := f.findFolder(parentID, name); id != "" {
+		return id, nil
+	}
+	f.creates++
+	return f.add(&node{parent: parentID, name: name, folder: true}), nil
+}
+
+func (f *fakeDrive) CreateFolder(_ context.Context, parentID, name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.findFolder(parentID, name) != "" {
+		f.dupes++ // the real Drive would now hold two folders of that name
+	}
+	f.creates++
+	return f.add(&node{parent: parentID, name: name, folder: true}), nil
+}
+
+func (f *fakeDrive) findFolder(parentID, name string) string {
 	for id, n := range f.nodes {
 		if n.folder && n.parent == parentID && n.name == name {
-			return id, nil
+			return id
 		}
 	}
-	return f.add(&node{parent: parentID, name: name, folder: true}), nil
+	return ""
 }
 
 func (f *fakeDrive) Upload(_ context.Context, parentID, name, localPath string, mod time.Time, _ string, progress func(int64)) (gdrive.File, error) {
@@ -73,6 +96,7 @@ func (f *fakeDrive) Upload(_ context.Context, parentID, name, localPath string, 
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.uploads = append(f.uploads, name)
 	id := f.add(&node{parent: parentID, name: name, data: data, mod: mod})
 	return gdrive.File{ID: id, Rel: name, MD5: md5hex(data), Size: int64(len(data)), ModTime: mod}, nil
 }
@@ -143,6 +167,7 @@ type fixture struct {
 	// windows makes sync act like CloudSync on Windows: names Windows
 	// can't store get stand-ins, loaded from the state DB on each run.
 	windows bool
+	workers int // engine.Options.Workers; 0 for the default
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -197,7 +222,7 @@ func (fx *fixture) sync() (*Result, *plan.Plan) {
 	var last Progress
 	calls := 0
 	res, err := FirstSync(context.Background(), fx.drive, fx.db,
-		Options{Root: "MyFiles", Local: fx.local, RootID: fx.rootID, Label: "Windows", Names: names,
+		Options{Root: "MyFiles", Local: fx.local, RootID: fx.rootID, Label: "Windows", Names: names, Workers: fx.workers,
 			Progress: func(pr Progress) {
 				if pr.Bytes < last.Bytes || pr.Bytes > pr.TotalBytes {
 					fx.t.Errorf("progress went from %+v to %+v", last, pr)
@@ -411,5 +436,40 @@ func TestWindowsStandIns(t *testing.T) {
 	fx.write("Hackathon␣/new.txt", "new")
 	if res, _ := fx.sync(); res.Uploaded != 1 || fx.drive.content(fx.rootID)["Hackathon /new.txt"] != "new" {
 		t.Errorf("third run = %+v, Drive has %v", res, fx.drive.content(fx.rootID))
+	}
+}
+
+func TestFolderCreation(t *testing.T) {
+	fx := newFixture(t)
+	fx.drive.EnsureFolder(context.Background(), fx.rootID, "Existing")
+	for _, rel := range []string{"Existing/New/a.txt", "Sem5/DBMS/Lab1/q.sql", "Sem5/DBMS/notes.pdf", "Sem5/OS/x.pdf", "Sem6/y.pdf"} {
+		fx.write(rel, "x")
+	}
+	fx.drive.lookups, fx.drive.creates = 0, 0
+
+	res, _ := fx.sync()
+	if res.Uploaded != 5 || res.Folders != 6 || len(res.Failed) != 0 {
+		t.Fatalf("result = %+v", res)
+	}
+	// Only folders whose parent existed before this run need a lookup:
+	// Existing/New, Sem5 and Sem6. Sem5/DBMS, Sem5/DBMS/Lab1 and Sem5/OS
+	// sit inside folders created in this run and skip it.
+	if fx.drive.lookups != 3 || fx.drive.creates != 6 || fx.drive.dupes != 0 {
+		t.Errorf("%d lookups, %d creates, %d duplicates; want 3, 6, 0", fx.drive.lookups, fx.drive.creates, fx.drive.dupes)
+	}
+	if got := fx.drive.content(fx.rootID); len(got) != 5 || got["Sem5/DBMS/Lab1/q.sql"] != "x" {
+		t.Errorf("Drive has %v", got)
+	}
+}
+
+func TestLargestFilesFirst(t *testing.T) {
+	fx := newFixture(t)
+	fx.workers = 1 // one at a time, so the start order is the queue order
+	for name, size := range map[string]int{"small.txt": 1, "big.bin": 300, "mid.pdf": 20, "tiny.md": 0} {
+		fx.write(name, strings.Repeat("x", size))
+	}
+	fx.sync()
+	if got, want := strings.Join(fx.drive.uploads, " "), "big.bin mid.pdf small.txt tiny.md"; got != want {
+		t.Errorf("upload order = %s, want %s", got, want)
 	}
 }
