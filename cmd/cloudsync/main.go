@@ -23,11 +23,17 @@ Commands:
   whoami    Show the signed-in account and Drive storage
   init      Choose the folder to sync and its Drive folder; writes config.toml
             --local PATH  --remote CloudSync/NAME  --max-file-size 500MB  --force
-  plan      Dry run: show what the first sync would do (changes nothing)
+  plan      Dry run: show what the next sync would do (changes nothing)
             --all  list every entry instead of the first 20 per section
-  sync      Run the first sync: upload, download and keep both copies of
-            conflicting files. Never deletes or overwrites. Safe to re-run.
+  sync      Sync now. The first sync of a folder uploads, downloads and keeps
+            both copies of conflicting files; it never deletes or overwrites.
+            Later syncs also carry over edits and deletes in both directions
+            (deleted files go to the trash). Safe to re-run.
             --yes  start without asking for confirmation
+  deletes   Show deletes held by the big-delete guard (more than 50 files or
+            10% of a folder at once)
+            approve  let them go ahead     cancel  put the files back
+            --all  list every held delete  --yes  don't ask for confirmation
   version   Print the version
 `
 
@@ -59,6 +65,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runPlan(ctx, args)
 	case "sync":
 		return runSync(ctx, args)
+	case "deletes":
+		return runDeletes(ctx, args)
 	case "version":
 		fmt.Println("cloudsync", version)
 		return nil

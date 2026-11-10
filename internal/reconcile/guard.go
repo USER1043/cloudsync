@@ -1,5 +1,10 @@
 package reconcile
 
+import (
+	"cmp"
+	"slices"
+)
+
 // Guard decides whether a run's deletes may go ahead without asking the
 // owner. It is an interface so the rule can change, for instance to one
 // worked out from the state DB's delete log, without touching Reconcile.
@@ -82,4 +87,51 @@ func Undo(a Action) Action {
 		return Action{Rel: a.Rel, Op: Download, Size: a.Size, DriveID: a.DriveID, Note: note}
 	}
 	return a
+}
+
+// Decision is the owner's answer to deletes the guard held earlier.
+type Decision int
+
+const (
+	Undecided Decision = iota
+	Approve            // run the held deletes
+	Cancel             // restore the held files instead
+)
+
+// Gate applies the big-delete guard to p. held maps the paths of deletes
+// held in an earlier run to their Op, and d is the owner's answer to them.
+//
+// It returns the plan to run now and the deletes to hold. Deletes that match
+// a held one run if approved, and are turned around with Undo if cancelled.
+// The other deletes, and all of them while undecided, are checked against g
+// together: under the threshold they run, over it they are all held. A
+// held delete the new plan no longer contains (the file came back, say) is
+// simply dropped.
+func Gate(p *Plan, g Guard, held map[string]Op, d Decision) (run *Plan, hold []Action) {
+	run, deletes := p.SplitDeletes()
+	var rest []Action
+	for _, a := range deletes {
+		op, ok := held[a.Rel]
+		switch {
+		case ok && op == a.Op && d == Approve:
+			run.Actions = append(run.Actions, a)
+		case ok && op == a.Op && d == Cancel:
+			run.Actions = append(run.Actions, Undo(a))
+		default:
+			rest = append(rest, a)
+		}
+	}
+	files := 0
+	for _, a := range rest {
+		if !a.Dir {
+			files++
+		}
+	}
+	if files > 0 && g.Hold(files, p.BaseFiles) {
+		hold = rest
+	} else {
+		run.Actions = append(run.Actions, rest...)
+	}
+	slices.SortFunc(run.Actions, func(a, b Action) int { return cmp.Compare(a.Rel, b.Rel) })
+	return run, hold
 }

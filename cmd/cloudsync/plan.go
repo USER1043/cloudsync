@@ -19,6 +19,7 @@ import (
 	"github.com/USER1043/cloudsync/internal/gdrive"
 	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/plan"
+	"github.com/USER1043/cloudsync/internal/reconcile"
 	"github.com/USER1043/cloudsync/internal/state"
 	"github.com/USER1043/cloudsync/internal/winname"
 )
@@ -86,6 +87,18 @@ func runPlan(ctx context.Context, args []string) error {
 		if err != nil {
 			return fmt.Errorf("root %q: %w", root.Name, err)
 		}
+		if done, err := firstSyncDone(ctx, db, root.Name); err != nil {
+			return err
+		} else if done && d != nil {
+			l, err := planLater(ctx, in, db, reconcile.Undecided)
+			if err != nil {
+				return fmt.Errorf("root %q: %w", root.Name, err)
+			}
+			printLater(w, l, limit)
+			upload += l.uploadBytes()
+			continue
+		}
+		in.planFirst()
 		printReport(w, in, d != nil, limit)
 		upload += in.uploadBytes()
 	}
@@ -96,7 +109,7 @@ func runPlan(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		printQuota(w, a, upload)
+		printQuota(w, a, "the next sync", upload)
 	} else {
 		fmt.Fprintf(w, "Total to upload: %s (Google's free tier is 15 GB, shared with Gmail and Photos)\n", humanBytes(upload))
 	}
@@ -126,11 +139,8 @@ func loadNames(ctx context.Context, db *state.DB, root string) (*winname.Map, er
 }
 
 // peekState opens the state database without the sync lock, for reading
-// stand-in names, or returns nil if there is none yet.
+// what earlier syncs recorded, or returns nil if there is none yet.
 func peekState() (*state.DB, error) {
-	if runtime.GOOS != "windows" {
-		return nil, nil
-	}
 	dir, err := config.StateDir()
 	if err != nil {
 		return nil, err
@@ -142,7 +152,7 @@ func peekState() (*state.DB, error) {
 	return state.Open(p)
 }
 
-// inspection is one root's local scan, Drive listing and first-sync plan.
+// inspection is one root's local scan and Drive listing.
 type inspection struct {
 	root         config.Root
 	local        string
@@ -151,11 +161,11 @@ type inspection struct {
 	scan         *localfs.Result
 	tree         *gdrive.Tree // Drive listing with ignored items removed
 	driveIgnored []string     // Drive paths the ignore rules and size limit left out
-	plan         *plan.Plan
+	plan         *plan.Plan   // first-sync plan, once planFirst has run
 }
 
-// inspect scans a root and, when d is not nil, lists its Drive folder and
-// works out the first-sync plan. It changes nothing.
+// inspect scans a root and, when d is not nil, lists its Drive folder. It
+// changes nothing.
 func inspect(ctx context.Context, root config.Root, m *filter.Matcher, d *gdrive.Client, names *winname.Map) (*inspection, error) {
 	local, err := root.LocalPath()
 	if err != nil {
@@ -178,11 +188,17 @@ func inspect(ctx context.Context, root config.Root, m *filter.Matcher, d *gdrive
 	// The scan's matcher includes the local .cloudsyncignore files, so Drive
 	// gets the same rules.
 	in.tree, in.driveIgnored = in.tree.Filter(in.scan.Matcher)
-	in.plan = plan.FirstSync(in.scan.Files, in.tree.Files, func(rel string) (string, error) {
-		return localfs.MD5File(filepath.Join(local, filepath.FromSlash(names.Local(rel))))
-	})
 	return in, nil
 }
+
+// hash returns the MD5 of the local file at the true path rel.
+func (in *inspection) hash(rel string) (string, error) {
+	return localfs.MD5File(filepath.Join(in.local, filepath.FromSlash(in.names.Local(rel))))
+}
+
+// planFirst works out the first-sync plan. It hashes local files that have
+// a Drive file of the same path and size.
+func (in *inspection) planFirst() { in.plan = plan.FirstSync(in.scan.Files, in.tree.Files, in.hash) }
 
 // uploadBytes is what the first sync would add to Drive: uploads plus the
 // local copies of conflicting files.
@@ -344,10 +360,12 @@ func itemLines(items []plan.Item) []string {
 	return lines
 }
 
-func printQuota(w io.Writer, a gdrive.Account, upload int64) {
+// printQuota shows the account's storage and whether what uploads (say,
+// "the first sync") adds fits.
+func printQuota(w io.Writer, a gdrive.Account, what string, upload int64) {
 	fmt.Fprintf(w, "Google account: %s <%s>\n", a.Name, a.Email)
 	if a.Limit <= 0 {
-		fmt.Fprintf(w, "Storage: no limit; the first sync uploads %s\n", humanBytes(upload))
+		fmt.Fprintf(w, "Storage: no limit; %s uploads %s\n", what, humanBytes(upload))
 		return
 	}
 	free := a.Limit - a.Usage
@@ -355,6 +373,6 @@ func printQuota(w io.Writer, a gdrive.Account, upload int64) {
 	if upload > free {
 		verdict = fmt.Sprintf("does NOT fit, %s short", humanBytes(upload-free))
 	}
-	fmt.Fprintf(w, "Storage: %s free of %s; the first sync uploads %s, which %s\n",
-		humanBytes(free), humanBytes(a.Limit), humanBytes(upload), verdict)
+	fmt.Fprintf(w, "Storage: %s free of %s; %s uploads %s, which %s\n",
+		humanBytes(free), humanBytes(a.Limit), what, humanBytes(upload), verdict)
 }

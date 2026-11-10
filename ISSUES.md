@@ -16,6 +16,7 @@ small uploads, Windows locking the running `.exe`) are recorded in
 | 3 | Fedora's Go is older than `go.mod` requires | fixed |
 | 4 | `client_secret.json` can be world-readable after copying | open |
 | 5 | Uploads slower than the connection allows | fixed |
+| 6 | A moved file is re-uploaded and its old copy trashed | open (by design until rename detection) |
 
 ## 1. Names that Windows can't store are skipped
 
@@ -145,3 +146,20 @@ small uploads, Windows locking the running `.exe`) are recorded in
   folders and 73 files (72 × 4 KB, 1 × 16 MB) took **122 s with the old
   build and 33 s with the new one**; a re-plan found all 73 in sync and no
   duplicate folders.
+
+## 6. A moved file is re-uploaded and its old copy trashed
+
+- **Found:** 2026-11-10, first dry run of a later sync on the real root.
+- **Symptom:** after folders are reorganized locally, the plan shows each
+  moved file twice: an upload at the new path and a trash in Drive at the
+  old one. On the real root about 30 of 37 Drive deletes were moves.
+- **Cause:** the reconciler compares paths only; it has no idea a file at a
+  new path is the same file as one gone from an old path.
+- **Impact:** correct end result (Drive matches the folder; old copies sit in
+  Drive's trash for 30 days), but moved files are uploaded again, and a big
+  reorganization trips the big-delete guard. The other OS then downloads the
+  new paths and trashes the old copies locally.
+- **Possible fix:** rename detection, already planned as a Phase 3
+  follow-up: match a deleted path with a new one of the same size and MD5
+  (locally) or the same Drive file ID (remotely), and move instead of
+  upload + trash (`files.update` with new parents in Drive, a rename here).

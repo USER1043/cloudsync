@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -208,5 +209,45 @@ func TestItemsAndDelete(t *testing.T) {
 	}
 	if _, ok, _ := db.Get(ctx, "Other", "c.txt"); !ok {
 		t.Error("Delete touched another root")
+	}
+}
+
+func TestHeldDeletes(t *testing.T) {
+	db := open(t)
+	ctx := context.Background()
+	if _, _, ok, err := db.PendingDeletes(ctx, "MyFiles"); ok || err != nil {
+		t.Fatalf("PendingDeletes on a new DB = %v, %v", ok, err)
+	}
+	first := []HeldDelete{{Rel: "a", Here: true, DriveID: "A", Size: 1}, {Rel: "b", Here: true}}
+	id, err := db.HoldDeletes(ctx, DeleteEvent{At: 1, Root: "MyFiles", OS: "Linux", Files: 100, Local: 2}, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The next run holds a different set: the same event is updated.
+	second := []HeldDelete{{Rel: "c", DriveID: "C", Size: 3}, {Rel: "d/", Dir: true, DriveID: "D"}}
+	id2, err := db.HoldDeletes(ctx, DeleteEvent{At: 2, Root: "MyFiles", OS: "Linux", Files: 100, Remote: 1}, second)
+	if err != nil || id2 != id {
+		t.Fatalf("second HoldDeletes = %d, %v; want the same event %d", id2, err, id)
+	}
+	ev, items, ok, err := db.PendingDeletes(ctx, "MyFiles")
+	if err != nil || !ok || ev.ID != id || ev.Remote != 1 || ev.Local != 0 || ev.At != 2 {
+		t.Fatalf("PendingDeletes = %+v, %v, %v", ev, ok, err)
+	}
+	if fmt.Sprint(items) != fmt.Sprint(second) {
+		t.Errorf("held = %+v, want %+v", items, second)
+	}
+
+	if err := db.ResolveDeletes(ctx, "MyFiles", DeletesApproved, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := db.PendingDeletes(ctx, "MyFiles"); ok {
+		t.Error("still pending after ResolveDeletes")
+	}
+	log, _ := db.DeleteLog(ctx, "MyFiles")
+	if len(log) != 1 || log[0].Decision != DeletesApproved || log[0].DecidedAt != 3 {
+		t.Errorf("log = %+v", log)
+	}
+	if err := db.ResolveDeletes(ctx, "MyFiles", DeletesCancelled, 4); err != nil {
+		t.Errorf("ResolveDeletes with nothing pending: %v", err)
 	}
 }

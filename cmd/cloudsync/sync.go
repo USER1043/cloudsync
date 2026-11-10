@@ -18,6 +18,7 @@ import (
 	"github.com/USER1043/cloudsync/internal/engine"
 	"github.com/USER1043/cloudsync/internal/filter"
 	"github.com/USER1043/cloudsync/internal/gdrive"
+	"github.com/USER1043/cloudsync/internal/reconcile"
 	"github.com/USER1043/cloudsync/internal/state"
 )
 
@@ -76,13 +77,6 @@ func runSync(ctx context.Context, args []string) error {
 }
 
 func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matcher, d *gdrive.Client, db *state.DB, yes bool) error {
-	if at, ok, err := db.Meta(ctx, metaFirstSync+root.Name); err != nil {
-		return err
-	} else if ok {
-		fmt.Fprintf(w, "\n== %s: first sync already completed (%s).\nContinuous two-way sync arrives in Phase 3.\n", root.Name, at)
-		return nil
-	}
-
 	names, err := loadNames(ctx, db, root.Name)
 	if err != nil {
 		return err
@@ -91,6 +85,12 @@ func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matc
 	if err != nil {
 		return err
 	}
+	if done, err := firstSyncDone(ctx, db, root.Name); err != nil {
+		return err
+	} else if done {
+		return syncLater(ctx, w, in, d, db, reconcile.Undecided, yes)
+	}
+	in.planFirst()
 	printReport(w, in, true, listLimit)
 
 	acc, err := d.Account(ctx)
@@ -98,7 +98,7 @@ func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matc
 		return err
 	}
 	fmt.Fprintln(w)
-	printQuota(w, acc, in.uploadBytes())
+	printQuota(w, acc, "the first sync", in.uploadBytes())
 	if acc.Limit > 0 && in.uploadBytes() > acc.Limit-acc.Usage {
 		return fmt.Errorf("not enough Drive storage; free up space or remove files from %s", in.local)
 	}
@@ -150,6 +150,16 @@ func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matc
 	}
 	fmt.Fprintf(w, "First sync of %s complete.\n", root.Name)
 	return nil
+}
+
+// firstSyncDone reports whether root's first sync has completed. A nil db
+// (no state yet) means it has not.
+func firstSyncDone(ctx context.Context, db *state.DB, root string) (bool, error) {
+	if db == nil {
+		return false, nil
+	}
+	_, ok, err := db.Meta(ctx, metaFirstSync+root)
+	return ok, err
 }
 
 // openState opens the state database and takes a lock so only one CloudSync

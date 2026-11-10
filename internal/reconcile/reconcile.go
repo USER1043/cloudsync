@@ -373,3 +373,75 @@ func (r *rec) dir(rel string) (Action, bool) {
 	}
 	return act(Forget, "")
 }
+
+// Total counts the actions and bytes of one kind.
+type Total struct {
+	Count int
+	Bytes int64
+}
+
+// Totals sums the plan's file actions by Op. Folders are left out.
+func (p *Plan) Totals() map[Op]Total {
+	t := make(map[Op]Total)
+	for _, a := range p.Actions {
+		if a.Dir {
+			continue
+		}
+		tot := t[a.Op]
+		tot.Count++
+		tot.Bytes += a.Size
+		t[a.Op] = tot
+	}
+	return t
+}
+
+// Of returns the plan's actions of one Op, folders included.
+func (p *Plan) Of(op Op) []Action {
+	var out []Action
+	for _, a := range p.Actions {
+		if a.Op == op {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// Changes reports whether the plan changes any file or folder, as opposed to
+// only updating the state DB.
+func (p *Plan) Changes() bool {
+	for _, a := range p.Actions {
+		if a.Op != Record && a.Op != Forget && a.Op != Wait {
+			return true
+		}
+	}
+	return false
+}
+
+// Skips returns the Input.Skip for a scan and a filtered Drive tree: every
+// path that is missing from one side for a reason other than deletion.
+// driveSkipped is what gdrive.Tree.Filter left out (ignored or over the size
+// limit; folders end in "/"). Without these, a file that grew past the size
+// limit on the phone, became a duplicate name in Drive or turned unreadable
+// here would look deleted and be trashed on the other side.
+func Skips(scan *localfs.Result, tree *gdrive.Tree, driveSkipped []string) func(string) bool {
+	skip := make(map[string]bool)
+	for _, rel := range scan.Repos {
+		skip[rel] = true
+	}
+	for _, f := range scan.TooLarge {
+		skip[f.Rel] = true
+	}
+	for _, is := range scan.Issues {
+		skip[is.Rel] = true
+	}
+	for _, is := range tree.Issues {
+		skip[is.Rel] = true
+	}
+	for _, f := range tree.Native {
+		skip[f.Rel] = true
+	}
+	for _, rel := range driveSkipped {
+		skip[strings.TrimSuffix(rel, "/")] = true
+	}
+	return func(rel string) bool { return skip[rel] }
+}

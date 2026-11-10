@@ -15,8 +15,8 @@ import (
 
 // schemaVersion 2 added items.local_name. A CloudSync that knows only
 // version 1 refuses the database rather than ignore the stand-in names.
-// The delete_log table was added later without a new version: older builds
-// never read it, so they can safely ignore it.
+// The delete_log and held_deletes tables were added later without a new
+// version: older builds never read them, so they can safely ignore them.
 const schemaVersion = 2
 
 const schema = `
@@ -47,6 +47,15 @@ CREATE TABLE IF NOT EXISTS delete_log (
 	held       INTEGER NOT NULL,
 	decision   TEXT    NOT NULL,
 	decided_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS held_deletes (
+	event_id INTEGER NOT NULL REFERENCES delete_log (id),
+	rel      TEXT    NOT NULL,
+	here     INTEGER NOT NULL,
+	is_dir   INTEGER NOT NULL,
+	drive_id TEXT    NOT NULL,
+	size     INTEGER NOT NULL,
+	PRIMARY KEY (event_id, rel)
 );`
 
 // migrations[v] upgrades a database from schema v to v+1.
@@ -235,6 +244,9 @@ const (
 	DeletesPending   = "pending"   // held; waiting for the owner
 	DeletesApproved  = "approved"  // held, then approved by the owner
 	DeletesCancelled = "cancelled" // held, then cancelled; the files were restored
+	// Superseded: held, then no longer needed before the owner answered,
+	// because a later run found nothing over the threshold to hold.
+	DeletesSuperseded = "superseded"
 )
 
 // DeleteEvent is one run's deletes, logged so the big-delete guard's
@@ -303,4 +315,106 @@ func (d *DB) DeleteLog(ctx context.Context, root string) ([]DeleteEvent, error) 
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// HeldDelete is one delete the big-delete guard is holding for the owner.
+type HeldDelete struct {
+	Rel     string
+	Here    bool // trash the local copy; false for the Drive copy
+	Dir     bool
+	DriveID string
+	Size    int64
+}
+
+// HoldDeletes records the deletes a run held. A root has at most one pending
+// event: if one is waiting already, it is updated to this run's counts and
+// deletes instead of logging a new one, so the log keeps one entry per
+// question asked. It returns the event's ID.
+func (d *DB) HoldDeletes(ctx context.Context, ev DeleteEvent, items []HeldDelete) (int64, error) {
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var id int64
+	err = tx.QueryRowContext(ctx, `SELECT id FROM delete_log WHERE root = ? AND decision = ?`, ev.Root, DeletesPending).Scan(&id)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO delete_log (at, root, os, files, local, remote, held, decision)
+			VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+			ev.At, ev.Root, ev.OS, ev.Files, ev.Local, ev.Remote, DeletesPending)
+		if err != nil {
+			return 0, err
+		}
+		if id, err = res.LastInsertId(); err != nil {
+			return 0, err
+		}
+	case err != nil:
+		return 0, err
+	default:
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE delete_log SET at = ?, os = ?, files = ?, local = ?, remote = ? WHERE id = ?`,
+			ev.At, ev.OS, ev.Files, ev.Local, ev.Remote, id); err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM held_deletes WHERE event_id = ?`, id); err != nil {
+			return 0, err
+		}
+	}
+	for _, it := range items {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO held_deletes (event_id, rel, here, is_dir, drive_id, size) VALUES (?, ?, ?, ?, ?, ?)`,
+			id, it.Rel, it.Here, it.Dir, it.DriveID, it.Size); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("saving held deletes: %w", err)
+	}
+	return id, nil
+}
+
+// PendingDeletes returns root's pending event and the deletes it holds, and
+// false if nothing is waiting for the owner.
+func (d *DB) PendingDeletes(ctx context.Context, root string) (DeleteEvent, []HeldDelete, bool, error) {
+	ev := DeleteEvent{Root: root, Held: true, Decision: DeletesPending}
+	err := d.db.QueryRowContext(ctx, `
+		SELECT id, at, os, files, local, remote FROM delete_log WHERE root = ? AND decision = ?`,
+		root, DeletesPending).Scan(&ev.ID, &ev.At, &ev.OS, &ev.Files, &ev.Local, &ev.Remote)
+	if errors.Is(err, sql.ErrNoRows) {
+		return DeleteEvent{}, nil, false, nil
+	}
+	if err != nil {
+		return DeleteEvent{}, nil, false, err
+	}
+	rows, err := d.db.QueryContext(ctx, `
+		SELECT rel, here, is_dir, drive_id, size FROM held_deletes WHERE event_id = ? ORDER BY rel`, ev.ID)
+	if err != nil {
+		return DeleteEvent{}, nil, false, err
+	}
+	defer rows.Close()
+	var items []HeldDelete
+	for rows.Next() {
+		var it HeldDelete
+		if err := rows.Scan(&it.Rel, &it.Here, &it.Dir, &it.DriveID, &it.Size); err != nil {
+			return DeleteEvent{}, nil, false, err
+		}
+		items = append(items, it)
+	}
+	return ev, items, true, rows.Err()
+}
+
+// ResolveDeletes records decision for root's pending event, if there is one,
+// and forgets the deletes it held.
+func (d *DB) ResolveDeletes(ctx context.Context, root, decision string, at int64) error {
+	ev, _, ok, err := d.PendingDeletes(ctx, root)
+	if err != nil || !ok {
+		return err
+	}
+	if err := d.DecideDeletes(ctx, ev.ID, decision, at); err != nil {
+		return err
+	}
+	_, err = d.db.ExecContext(ctx, `DELETE FROM held_deletes WHERE event_id = ?`, ev.ID)
+	return err
 }

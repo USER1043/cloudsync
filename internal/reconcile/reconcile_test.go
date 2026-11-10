@@ -2,10 +2,12 @@ package reconcile
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/USER1043/cloudsync/internal/filter"
 	"github.com/USER1043/cloudsync/internal/gdrive"
 	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/state"
@@ -283,5 +285,76 @@ func TestSplitAndUndo(t *testing.T) {
 	want := "d=create folder in Drive\nd/a=upload\nd/b=upload\nd/c=upload\n"
 	if got != want {
 		t.Errorf("undone:\n%swant\n%s", got, want)
+	}
+}
+
+func TestGate(t *testing.T) {
+	// 60 files deleted in Drive, plus their folder and one upload.
+	var local []localfs.File
+	var bases []state.Item
+	for i := range 60 {
+		rel := fmt.Sprintf("old/f%02d", i)
+		local = append(local, lfile(rel, "v1", t0))
+		bases = append(bases, base(rel, rel, "v1", t0))
+	}
+	for i := range 940 { // the rest of a 1,000-file root, unchanged
+		rel := fmt.Sprintf("keep/f%03d", i)
+		local = append(local, lfile(rel, "v1", t0))
+		bases = append(bases, base(rel, rel, "v1", t0))
+	}
+	bases = append(bases, bdir("old"))
+	h, _ := hasher(nil)
+	in := Input{Local: append(local, lfile("new", "x", t0)), LocalDirs: []string{"old"}, Base: bases, Hash: h}
+	in.Remote = make([]gdrive.File, 0, 940)
+	for i := range 940 {
+		rel := fmt.Sprintf("keep/f%03d", i)
+		in.Remote = append(in.Remote, rfile(rel, rel, "v1"))
+	}
+	p := Reconcile(in)
+
+	run, hold := Gate(p, DefaultGuard, nil, Undecided)
+	if got := summary(run); got != "new=upload\n" || len(hold) != 61 {
+		t.Fatalf("undecided: run\n%sheld %d; want only the upload to run and 60 files + 1 folder held", got, len(hold))
+	}
+	held := make(map[string]Op)
+	for _, a := range hold {
+		held[a.Rel] = a.Op
+	}
+
+	run, hold = Gate(p, DefaultGuard, held, Approve)
+	if l, _ := run.Deletes(); l != 60 || len(hold) != 0 {
+		t.Errorf("approved: %d deletes run, %d held; want 60 and 0", l, len(hold))
+	}
+	run, hold = Gate(p, DefaultGuard, held, Cancel)
+	if l, _ := run.Deletes(); l != 0 || len(hold) != 0 || run.Totals()[Upload].Count != 61 || len(run.Of(MkdirRemote)) != 1 {
+		t.Errorf("cancelled: %d deletes, %d held, totals %v; want the 60 files and their folder restored to Drive", l, len(hold), run.Totals())
+	}
+
+	// A few deletes under the threshold run without asking.
+	small := Reconcile(Input{Local: local[:3], Base: bases[:3], Hash: h, Remote: nil})
+	small.BaseFiles = 1000
+	if run, hold := Gate(small, DefaultGuard, nil, Undecided); len(hold) != 0 || len(run.Actions) != 3 {
+		t.Errorf("3 of 1000: held %d, run %d; want all 3 run", len(hold), len(run.Actions))
+	}
+}
+
+func TestSkips(t *testing.T) {
+	scan := &localfs.Result{
+		Repos:    []string{"code/proj"},
+		TooLarge: []localfs.File{{Rel: "video.mp4"}},
+		Issues:   []filter.Issue{{Rel: "locked.xlsx"}},
+	}
+	tree := &gdrive.Tree{
+		Issues: []filter.Issue{{Rel: "dupe.txt"}},
+		Native: []gdrive.File{{Rel: "Plan"}},
+	}
+	skip := Skips(scan, tree, []string{"phone-big.mov", "node_modules/"})
+	for _, rel := range []string{"code/proj", "video.mp4", "locked.xlsx", "dupe.txt", "Plan", "phone-big.mov", "node_modules"} {
+		if !skip(rel) {
+			t.Errorf("Skips(%q) = false", rel)
+		}
+	}
+	if skip("notes.txt") {
+		t.Error("Skips(notes.txt) = true")
 	}
 }

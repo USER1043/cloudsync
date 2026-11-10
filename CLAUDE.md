@@ -58,25 +58,28 @@ design for that limit, including quota checks.
 
 ## Status
 
-### Where we left off (2026-11-05): give the owner this when they ask
+### Where we left off (2026-11-10): give the owner this when they ask
 
-Paused by the owner partway through Phase 3 (background service). Committed,
-not pushed.
+Phase 3 (background service), step 2 of 6 done: two-way sync by hand.
 
-- **Works:** first sync on both OSes (done and verified), faster uploads.
-- **Built and tested, but not yet runnable:** the two-way sync logic. The
-  reconciler decides what each file needs, the big-delete guard holds more
-  than 50 files or 10% (each run logged so the threshold can be tuned), and
-  the engine carries it out: updates in place, downloads, trash to KDE
-  Trash or Recycle Bin and Drive's trash, keep-both conflicts, and
-  protection against edits made mid-sync.
-- **Not yet:** there is no `cloudsync run` command, so edits made after the
-  first sync still don't sync. The new Drive calls are untested against
-  real Drive, and the Recycle Bin code is untested on Windows.
-- **Next:** step 2, the `cloudsync run` catch-up at boot. Its Skip list must
-  include Google Docs, Drive duplicate names, files over the size limit and
-  unreadable files. Then live upload, shutdown blocking, error messages and
-  notifications, and start at login. After that, catch Windows up.
+- **Works now:** after a folder's first sync, `cloudsync plan` shows and
+  `cloudsync sync` carries out a two-way sync: edits, new files and
+  deletes in both directions (deletes to the Trash/Recycle Bin or Drive's
+  trash), keep-both conflicts. The big-delete guard holds more than 50
+  files or 10%; `cloudsync deletes` shows them, `approve` runs them and
+  `cancel` puts the files back. Live-tested 2026-11-10 with two scratch
+  "computers" on `CloudSync-Test/TwoWay-1110`: in-place update kept the
+  Drive ID, trash both ways, guard hold, cancel, approve, conflict.
+- **Real `MyFiles`:** dry run on 2026-11-10 showed 115 uploads, 37 Drive
+  deletes (mostly moves, `ISSUES.md` #6; 8 files really gone locally) and
+  47 new folders, under the guard's threshold. Not synced yet; waiting for
+  the owner's go-ahead.
+- **Not yet:** the background service (`cloudsync run`), live upload,
+  shutdown blocking, notifications, start at login, Windows catch-up.
+  The Recycle Bin code is untested on Windows.
+- **Next:** step 3, `cloudsync run`: catch-up at start (what `sync` does
+  now, with `--yes` and held deletes left for `cloudsync deletes`), then
+  live upload of local edits.
 
 | Phase | State |
 |---|---|
@@ -87,11 +90,11 @@ not pushed.
 | Windows-name translation (`internal/winname`, `ISSUES.md` #1, #2) | done on Linux; verify on Windows |
 | Fedora first sync of `~/My_Files` | **done and verified** 2026-10-28: nothing failed; re-plan shows 1,341 files in sync, 0 to transfer |
 | Faster uploads (`ISSUES.md` #5) | **done** 2026-11-03: test sync of 52 folders + 73 files went from 122 s to 33 s |
-| 3: continuous two-way sync daemon (background service) | **in progress**: reconciler, big-delete guard and delete log done; engine runs its actions (`engine.Sync`, `internal/trash`). Next: `cloudsync run` catch-up at boot |
+| 3: continuous two-way sync daemon (background service) | **in progress**: two-way `plan`/`sync` by hand and `cloudsync deletes` done and live-tested 2026-11-10. Next: `cloudsync run` |
 
-After a root's first sync, `cloudsync sync` only reports "already completed".
-Until Phase 3, later edits don't sync, and files coming from Fedora reach
-Drive and the phone but not Windows.
+After a root's first sync, `cloudsync sync` runs a two-way sync by hand
+(`cmd/cloudsync/twoway.go`). Nothing syncs on its own until `cloudsync run`
+exists, and Windows still runs the old build.
 
 ### Fedora first sync (2026-10-28)
 
@@ -172,7 +175,7 @@ Packages:
 
 | Package | Role |
 |---|---|
-| `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`; terminal progress bar (`progress.go`) |
+| `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`, `deletes`; terminal progress bar (`progress.go`). `plan`/`sync` use `plan.FirstSync` until a root's first sync is done, then `twoway.go`: `planLater` (root-folder checks, `reconcile.Reconcile` with `Skips`, `Gate`), `syncLater`/`runLater` (delete log, held deletes, `engine.Sync`). `deletes approve`/`cancel` run a full sync with that answer, so held deletes are re-checked first |
 | `internal/config` | `config.toml` load/write/validate, `ParseSize`, per-OS dirs. No built-in default root: a missing config returns `ErrNoConfig` |
 | `internal/auth` | OAuth loopback + PKCE, token in OS keyring, refreshed tokens saved back |
 | `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, `Update` in place (refuses with `ErrChanged` if Drive's copy isn't the last-synced checksum), `Trash`, `HasChildren`, downloads, `Retry` (backoff on 429/5xx/rate-limit 403), `countingTransport` for upload progress, `Tree.Filter` |
@@ -182,8 +185,8 @@ Packages:
 | `internal/plan` | `FirstSync`: pure union-merge planner; exact path matching |
 | `internal/engine` | Carries out a plan (`FirstSync` from `plan`, `Sync` from `reconcile`; both run the same reconcile actions): folders a depth at a time (each depth in parallel; `CreateFolder` skips the lookup inside folders made in the same run), then 8 parallel transfers, largest first, MD5-verified, atomic downloads (`.name.cloudsync-partial` then rename), keep-both conflicts, progress callbacks. `Sync` checks every change against what the plan saw: a local file saved after the scan is never overwritten or trashed, and an update that finds a newer Drive edit becomes a conflict. Trashes go to `Options.Trash` (default `trash.Move`) or Drive's trash; folders are removed only when empty |
 | `internal/trash` | `Move` to the OS trash: freedesktop.org Trash on Linux (home trash, or the file system's `.Trash-$uid` across devices/subvolumes), Recycle Bin via `SHFileOperationW` on Windows (asks before deleting outright what the Recycle Bin can't take) |
-| `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`); `delete_log` (each run's deletes, root size, whether the guard held them and the owner's answer) |
-| `internal/reconcile` | Phase 3 planner: `Reconcile`, a pure three-way comparison of scan, Drive tree and base (state DB) into actions (upload, download, trash here or in Drive, conflict, folders, record, forget, wait); `Skip` keeps paths missing for other reasons (too large, unreadable, repos) from being trashed. `Guard` interface with `DefaultGuard` (more than 50 files or 10%), `SplitDeletes` and `Undo` for held deletes |
+| `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`); `delete_log` (each run's deletes, root size, whether the guard held them and the owner's answer: auto, pending, approved, cancelled, superseded) and `held_deletes` (the pending event's deletes; one pending event per root) |
+| `internal/reconcile` | Phase 3 planner: `Reconcile`, a pure three-way comparison of scan, Drive tree and base (state DB) into actions (upload, download, trash here or in Drive, conflict, folders, record, forget, wait); `Skip` keeps paths missing for other reasons (too large, unreadable, repos) from being trashed. `Skips` builds it from the scan and Drive tree (repos, too large, unreadable, Drive duplicates, Google Docs, Drive-side filtered). `Guard` interface with `DefaultGuard` (more than 50 files or 10%); `Gate` applies it with the owner's answer to earlier held deletes (approve runs them, cancel `Undo`es them) |
 
 **The root name is the state DB key; never rename the `MyFiles` root.** The
 Drive change-feed start token is saved before the first sync touches
