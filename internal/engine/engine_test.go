@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -424,6 +425,9 @@ func TestConflictName(t *testing.T) {
 
 func TestUploadsNamesWindowsCannotStore(t *testing.T) {
 	// On Linux, such names go to Drive exactly as they are.
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows can't store these names")
+	}
 	fx := newFixture(t)
 	fx.write("Hackathon /Paper:1.pdf", "paper")
 	fx.write("Notes.txt", "upper")

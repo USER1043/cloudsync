@@ -3,6 +3,7 @@ package localfs
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -132,6 +133,9 @@ func TestScanSymlink(t *testing.T) {
 func TestScanKeepsWindowsOnlyNames(t *testing.T) {
 	// Linux can hold names Windows can't, and names that differ only by
 	// case. They all sync; Windows gives them stand-ins later.
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows can't store these names")
+	}
 	root := t.TempDir()
 	for _, rel := range []string{"Hackathon /plan.pdf", "Paper:1.pdf", "Notes.txt", "notes.txt", "con.txt"} {
 		write(t, root, rel, "x")
