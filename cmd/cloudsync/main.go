@@ -39,7 +39,10 @@ Commands:
             sync --yes does, holding big deletes for you), then upload local
             changes a few seconds after they happen. Drive is checked again
             at the next start or sync. Ctrl-C uploads the last changes and
-            stops. Needs a first sync with sync.
+            stops. Needs a first sync with sync. Shows desktop notifications
+            for what needs you (held deletes, conflicts, sign-in, Drive full).
+  status    Show whether run is going, when Drive was last checked, what is
+            waiting to upload, held deletes and recent warnings
   version   Print the version
 `
 
@@ -52,7 +55,7 @@ func main() {
 	err := run(ctx, os.Args[1], os.Args[2:])
 	stop()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+		fmt.Fprintln(os.Stderr, "error:", describe(err))
 		os.Exit(1)
 	}
 }
@@ -75,6 +78,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runDeletes(ctx, args)
 	case "run":
 		return runRun(ctx, args)
+	case "status":
+		return runStatusCmd(ctx, args)
 	case "version":
 		fmt.Println("cloudsync", version)
 		return nil

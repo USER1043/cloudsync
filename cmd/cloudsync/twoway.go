@@ -299,7 +299,7 @@ func runLater(ctx context.Context, w io.Writer, l *later, d *gdrive.Client, db *
 		}
 	}
 
-	opt := engine.Options{Root: root, Local: l.in.local, RootID: l.rootID, Label: osLabel(), Log: w, Names: l.in.names}
+	opt := engine.Options{Root: root, Local: l.in.local, RootID: l.rootID, Label: osLabel(), Log: w, Names: l.in.names, Explain: describe}
 	if f, ok := w.(*os.File); ok && l.run.Changes() {
 		fmt.Fprintln(w)
 		if bar := newProgressBar(f); bar != nil {
@@ -316,7 +316,16 @@ func runLater(ctx context.Context, w io.Writer, l *later, d *gdrive.Client, db *
 		}
 		return res, fmt.Errorf("sync stopped: %w (run `cloudsync sync` again to continue)", err)
 	}
-	return res, nil
+	// For `cloudsync status`: a full sync compared with Drive; a live pass
+	// only uploaded.
+	stamp := time.Now().Format(time.RFC3339)
+	switch {
+	case !l.live:
+		err = db.SetMeta(ctx, metaLastCheck+root, stamp)
+	case l.run.Changes():
+		err = db.SetMeta(ctx, metaLastUpload+root, stamp)
+	}
+	return res, err
 }
 
 // files is "1 file" or "N files", right-aligned for tables.

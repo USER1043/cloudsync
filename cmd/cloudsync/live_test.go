@@ -107,7 +107,7 @@ func (f *liveFixture) plan(settleFor time.Duration) (*later, bool) {
 	return l, recent
 }
 
-func describe(acts []reconcile.Action) []string {
+func opsOf(acts []reconcile.Action) []string {
 	var out []string
 	for _, a := range acts {
 		s := fmt.Sprintf("%v %s", a.Op, a.Rel)
@@ -153,12 +153,12 @@ func TestPlanLive(t *testing.T) {
 		"upload sub/new.txt",
 		"record touched.txt id-touched.txt",
 	}
-	if got := describe(l.run.Actions); !slices.Equal(got, want) {
+	if got := opsOf(l.run.Actions); !slices.Equal(got, want) {
 		t.Errorf("run =\n  %s\nwant\n  %s", strings.Join(got, "\n  "), strings.Join(want, "\n  "))
 	}
 	// 2 file deletes (sub/held.txt is held already) of 6 files is over 10%.
 	want = []string{"trash in Drive deleted.txt id-deleted.txt", "trash in Drive gone id-gone", "trash in Drive gone/x.txt id-gone/x.txt"}
-	if got := describe(l.hold); !slices.Equal(got, want) {
+	if got := opsOf(l.hold); !slices.Equal(got, want) {
 		t.Errorf("hold = %q, want %q", got, want)
 	}
 	if !l.live || !l.pending || len(l.heldItems) != 1 {
@@ -167,8 +167,8 @@ func TestPlanLive(t *testing.T) {
 
 	// The final pass at exit doesn't wait for files to settle.
 	l, recent = f.plan(0)
-	if recent || !slices.Contains(describe(l.run.Actions), "upload recent.txt") {
-		t.Errorf("final pass: recent=%v run=%q; want recent.txt uploaded", recent, describe(l.run.Actions))
+	if recent || !slices.Contains(opsOf(l.run.Actions), "upload recent.txt") {
+		t.Errorf("final pass: recent=%v run=%q; want recent.txt uploaded", recent, opsOf(l.run.Actions))
 	}
 }
 
@@ -181,7 +181,7 @@ func TestPlanLiveOnlyUploads(t *testing.T) {
 	}
 	f.synced("deleted.txt", "x", false)
 	l, _ := f.plan(settle)
-	if got := describe(l.run.Actions); !slices.Equal(got, []string{"trash in Drive deleted.txt id-deleted.txt"}) {
+	if got := opsOf(l.run.Actions); !slices.Equal(got, []string{"trash in Drive deleted.txt id-deleted.txt"}) {
 		t.Errorf("run = %q", got)
 	}
 	for _, a := range l.plan.Actions {
@@ -209,7 +209,7 @@ func TestLiveHoldMerges(t *testing.T) {
 	}
 	l, _ := f.plan(settle)
 	if len(l.hold) != 60 || l.run.Changes() {
-		t.Fatalf("hold %d, run %q; want the 60 new deletes held and nothing else", len(l.hold), describe(l.run.Actions))
+		t.Fatalf("hold %d, run %q; want the 60 new deletes held and nothing else", len(l.hold), opsOf(l.run.Actions))
 	}
 	// Nothing runs in Drive, so a nil client is never called.
 	if _, err := runLater(f.ctx, &bytes.Buffer{}, l, (*gdrive.Client)(nil), f.db); err != nil {

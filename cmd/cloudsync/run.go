@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -21,8 +20,10 @@ import (
 	"github.com/USER1043/cloudsync/internal/engine"
 	"github.com/USER1043/cloudsync/internal/filter"
 	"github.com/USER1043/cloudsync/internal/gdrive"
+	"github.com/USER1043/cloudsync/internal/notify"
 	"github.com/USER1043/cloudsync/internal/reconcile"
 	"github.com/USER1043/cloudsync/internal/shutdown"
+	"github.com/USER1043/cloudsync/internal/state"
 	"github.com/USER1043/cloudsync/internal/watch"
 )
 
@@ -33,6 +34,9 @@ const (
 	flushTimeout = 40 * time.Second // the last pass at exit gives up after this, inside Fedora's 45 s stop timeout
 	minRetry     = 30 * time.Second // after a failure, wait this long, doubling each time...
 	maxRetry     = 5 * time.Minute  // ...up to this
+
+	offlineNotice = 30 * time.Minute // tell the owner once Drive has been out of reach this long
+	troubleNotice = 10 * time.Minute // ... or failing for any other reason this long
 )
 
 var errNoFirstSync = errors.New("this folder hasn't had its first sync yet. Run `cloudsync sync` once first " +
@@ -56,6 +60,13 @@ type daemon struct {
 
 	id string // computerID; set by the first catch-up
 
+	notes *notify.Notifier // nil if notifications aren't available
+	st    *statusKeeper    // for `cloudsync status`
+
+	// When the current run of failures began, by kind; zero if none. Used
+	// only by the catch-up and the live loop, one after the other.
+	offlineSince, troubleSince time.Time
+
 	mu     sync.Mutex
 	listed map[*session]bool // sessions whose pending list was saved at this shutdown
 }
@@ -76,6 +87,18 @@ func runRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	dir, err := config.StateDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	unlock, err := lockRun(dir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	d, err := e.drive(ctx)
 	if err != nil {
 		return err
@@ -90,9 +113,16 @@ func runRun(ctx context.Context, args []string) error {
 	dm := &daemon{
 		cfg: e.cfg, m: m, d: d, log: newLogWriter(os.Stdout), w: w,
 		stop: stop, done: make(chan struct{}), stopping: make(chan struct{}, 1), listed: map[*session]bool{},
+		st: newStatusKeeper(dir),
 	}
 	defer close(dm.done)
 	dm.logf("CloudSync %s started (config %s).", version, e.cfg.Path())
+	if dm.notes, err = notify.New(); err != nil {
+		dm.logf("Desktop notifications aren't available (%v); warnings go to this log and `cloudsync status` only.", err)
+	} else {
+		defer dm.notes.Close()
+	}
+	dm.st.set("starting", "")
 
 	err = dm.catchUpAll(ctx)
 	if err == nil {
@@ -107,32 +137,144 @@ func runRun(ctx context.Context, args []string) error {
 	}
 	switch {
 	case ctx.Err() != nil && (err == nil || errors.Is(err, context.Canceled)):
+		dm.st.set("stopped", "")
 		dm.logf("Stopped.")
 		return nil
-	case gdrive.SignInRejected(err):
-		return fmt.Errorf("Google no longer accepts CloudSync's sign-in (it expired or was revoked). "+
-			"Run `cloudsync login`, then start `cloudsync run` again (%w)", err)
+	case fatal(err):
+		// Only the owner can fix these; say so where they'll see it.
+		msg := describe(err)
+		if classify(err) == kindSignIn {
+			msg += ", then start `cloudsync run` again"
+		}
+		dm.st.set("stopped: needs you", msg)
+		dm.alert(notify.Message{Key: "stopped", Title: "CloudSync stopped syncing", Body: msg, Critical: true})
+	default:
+		dm.st.set("stopped", describe(err))
 	}
 	return err
+}
+
+// alert shows a notification and keeps it for `cloudsync status`.
+func (dm *daemon) alert(m notify.Message) {
+	if _, err := dm.notes.Send(m); err != nil {
+		dm.logf("Couldn't show a notification: %v", err)
+	}
+	dm.st.warn(m)
+}
+
+// resolve takes down the notification under key once its problem is gone.
+func (dm *daemon) resolve(key string) {
+	dm.notes.Clear(key)
+	dm.st.resolve(key)
+}
+
+// trouble records a failed attempt that CloudSync will retry: it updates
+// the status, and tells the owner once the problem has lasted long enough
+// to matter. Brief outages stay quiet.
+func (dm *daemon) trouble(err error) {
+	now := time.Now()
+	msg := describe(err)
+	switch classify(err) {
+	case kindRateLimit:
+		dm.st.set("slowed down by Google", msg)
+	case kindQuota:
+		dm.st.set("paused: Drive is full", msg)
+		dm.alert(notify.Message{Key: "quota", Title: "Google Drive is full", Body: msg, Critical: true})
+	case kindOffline:
+		if dm.offlineSince.IsZero() {
+			dm.offlineSince = now
+		}
+		dm.st.set("offline", msg)
+		if d := now.Sub(dm.offlineSince); d >= offlineNotice {
+			dm.alert(notify.Message{Key: "offline", Title: "CloudSync can't reach Google Drive",
+				Body: fmt.Sprintf("Not since %s (%s). Changes made here are kept and sync once the connection is back.",
+					dm.offlineSince.Format("15:04"), msg)})
+		}
+	default:
+		if dm.troubleSince.IsZero() {
+			dm.troubleSince = now
+		}
+		title := "CloudSync keeps failing"
+		if classify(err) == kindGoogle {
+			title = "Google Drive is having problems"
+			dm.st.set("waiting for Google Drive", msg)
+		} else {
+			dm.st.set("failing", msg)
+		}
+		if now.Sub(dm.troubleSince) >= troubleNotice {
+			dm.alert(notify.Message{Key: "trouble", Title: title, Body: msg + ". CloudSync keeps trying."})
+		}
+	}
+}
+
+// recovered clears what trouble set, after an attempt that worked.
+func (dm *daemon) recovered() {
+	dm.offlineSince, dm.troubleSince = time.Time{}, time.Time{}
+	for _, key := range []string{"offline", "trouble", "quota"} {
+		dm.resolve(key)
+	}
+	dm.st.set("in sync", "")
+}
+
+// afterSync tells the owner what a finished sync of root left for them:
+// held deletes, conflict copies and files that keep failing.
+func (dm *daemon) afterSync(ctx context.Context, root string, res *engine.Result, db *state.DB) {
+	key := "held:" + root
+	if ev, _, ok, err := db.PendingDeletes(ctx, root); err == nil && ok {
+		n := ev.Local + ev.Remote
+		verb := "are"
+		if n == 1 {
+			verb = "is"
+		}
+		dm.alert(notify.Message{Key: key, Title: "Deletes held for your review", Critical: true,
+			Body: fmt.Sprintf("%s deleted at once in %s %s waiting for your answer. Run `cloudsync deletes` to review, "+
+				"then approve or cancel.", count(n, "file", "files"), root, verb)})
+	} else if err == nil {
+		dm.resolve(key)
+	}
+
+	if c := res.Conflicted; len(c) > 0 {
+		body := fmt.Sprintf("%s was changed both here and in Drive. Your version is next to it as a \"(conflict %s ...)\" copy; "+
+			"compare the two and delete the one you don't want.", c[0], osLabel())
+		if len(c) > 1 {
+			body = fmt.Sprintf("%s were changed both here and in Drive: %s. Your version of each is next to it as a "+
+				"\"(conflict %s ...)\" copy; compare them and delete the ones you don't want.", count(len(c), "file", "files"), listed(c, 3), osLabel())
+		}
+		dm.alert(notify.Message{Key: "conflict:" + root, Title: "Edited in two places: both versions kept", Body: body})
+	}
+
+	key = "failed:" + root
+	if len(res.Failed) == 0 {
+		dm.resolve(key)
+		return
+	}
+	// When Drive is out of reach every file fails; that is trouble's to
+	// report, not a list of files.
+	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if ctx.Err() != nil || dm.d.Ping(pctx) != nil {
+		return
+	}
+	lines := make([]string, len(res.Failed))
+	for i, f := range res.Failed {
+		lines[i] = f.Rel + ": " + f.Reason
+	}
+	dm.alert(notify.Message{Key: key, Title: "Some files can't be synced",
+		Body: listed(lines, 3) + ". CloudSync keeps trying."})
+}
+
+// listed joins up to n items, then says how many more there are.
+func listed(items []string, n int) string {
+	if len(items) <= n {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:n], ", ") + fmt.Sprintf(" and %d more", len(items)-n)
 }
 
 // fatal reports whether err needs the owner: retrying won't fix it.
 func fatal(err error) bool {
 	var re *rootError
 	return errors.As(err, &re) || errors.Is(err, errNoFirstSync) || gdrive.SignInRejected(err) || signInMissing(err)
-}
-
-// explain describes a failure that CloudSync will retry. For a network
-// failure, the cause is enough; the request's long URL is noise.
-func explain(err error) string {
-	if !gdrive.Temporary(err) {
-		return err.Error()
-	}
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		err = ue.Err
-	}
-	return fmt.Sprintf("can't reach Google Drive (offline, or Google is having problems): %v", err)
 }
 
 // count is "1 file" or "N files".
@@ -162,11 +304,13 @@ func (dm *daemon) catchUpAll(ctx context.Context) error {
 				return fmt.Errorf("root %q: %w", root.Name, err)
 			default:
 				dm.logf("%s: catching up with Drive failed: %s. Trying again in %s; nothing is lost meanwhile.",
-					root.Name, explain(err), delay)
+					root.Name, describe(err), delay)
+				dm.trouble(err)
 				failed = append(failed, root)
 			}
 		}
 		if len(failed) == 0 {
+			dm.recovered()
 			return nil
 		}
 		select {
@@ -198,6 +342,7 @@ func (dm *daemon) catchUp(ctx context.Context, root config.Root) (*session, erro
 		}
 	}
 	dm.logf("%s: catching up with Drive...", root.Name)
+	dm.st.set("catching up with Drive", root.Name)
 	names, err := loadNames(ctx, db, root.Name)
 	if err != nil {
 		return nil, err
@@ -226,6 +371,7 @@ func (dm *daemon) catchUp(ctx context.Context, root config.Root) (*session, erro
 		return nil, err
 	}
 	dm.report(root.Name, res, start)
+	dm.afterSync(ctx, root.Name, res, db)
 	if len(res.Failed) > 0 {
 		dm.logf("%s: %s could not be synced (listed above); CloudSync tries again at the next start, or run `cloudsync sync`.",
 			root.Name, count(len(res.Failed), "file", "files"))
@@ -302,13 +448,16 @@ func (dm *daemon) live(ctx context.Context) error {
 				delay := min(minRetry<<min(failures, 4), maxRetry)
 				failures++
 				if err != nil {
-					dm.logf("Sync failed: %s. Trying again in %s; your changes are kept until then.", explain(err), delay)
+					dm.logf("Sync failed: %s. Trying again in %s; your changes are kept until then.", describe(err), delay)
+					dm.trouble(err)
 				} else {
 					dm.logf("Trying the failed files again in %s.", delay)
+					dm.st.set("retrying files that failed", "")
 				}
 				sched.at(time.Now().Add(delay))
 			default:
 				failures = 0
+				dm.recovered()
 				if soon {
 					// A file was still being written; look again once it settles.
 					sched.at(time.Now().Add(settle + 500*time.Millisecond))
@@ -323,6 +472,7 @@ func (dm *daemon) live(ctx context.Context) error {
 // so does being offline: waiting would only hold up the shutdown.
 func (dm *daemon) flush() error {
 	dm.logf("Stopping: uploading the last changes first (Ctrl-C again to quit now)...")
+	dm.st.set("stopping", "")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, flushTimeout)
@@ -331,7 +481,7 @@ func (dm *daemon) flush() error {
 	err := dm.d.Ping(pctx)
 	pcancel()
 	if err != nil {
-		dm.logf("Not uploading: %s. Changes not uploaded yet stay here and upload at the next start.", explain(err))
+		dm.logf("Not uploading: %s. Changes not uploaded yet stay here and upload at the next start.", describe(err))
 		return nil
 	}
 	if _, failed, err := dm.pass(ctx, 0); err != nil || failed {
@@ -375,7 +525,7 @@ func (dm *daemon) shutdownStarting(ctx context.Context) {
 		n := count(len(p.Files), "file", "files")
 		switch {
 		case err != nil:
-			dm.logf("%s: couldn't save the list of changes not uploaded yet (%s); they upload at the next start.", s.root.Name, explain(err))
+			dm.logf("%s: couldn't save the list of changes not uploaded yet (%s); they upload at the next start.", s.root.Name, describe(err))
 		case len(p.Files) > 0:
 			dm.mu.Lock()
 			dm.listed[s] = true
@@ -480,6 +630,11 @@ func (dm *daemon) warnStale(ctx context.Context, root config.Root, metaID string
 		dm.logf("%s: WARNING: %s shut down on %s before uploading %s, so these are missing or out of date here until it "+
 			"next starts online (editing them here first leaves conflict copies to sort out): %s",
 			root.Name, who, p.At.Local().Format("2 Jan 15:04"), count(len(stale), "change", "changes"), strings.Join(paths, ", "))
+		dm.alert(notify.Message{Key: "stale:" + root.Name + ":" + p.Computer, Critical: true,
+			Title: who + " didn't upload everything",
+			Body: fmt.Sprintf("It shut down on %s before uploading %s, so these are missing or out of date here: %s. "+
+				"They arrive when it next starts online; editing them here first leaves conflict copies.",
+				p.At.Local().Format("2 Jan 15:04"), count(len(stale), "change", "changes"), listed(paths, 5))})
 	}
 }
 
@@ -509,6 +664,9 @@ func (dm *daemon) passRoot(ctx context.Context, s *session, settleFor time.Durat
 	}
 	dm.watch(s, l.in)
 	if len(l.run.Actions) == 0 && len(l.hold) == 0 {
+		// Nothing to do, but a problem may have gone away meanwhile: held
+		// deletes answered, a failing file fixed or removed.
+		dm.afterSync(ctx, s.root.Name, &engine.Result{}, db)
 		return soon, false, nil
 	}
 	if l.run.Changes() || len(l.hold) > 0 {
@@ -525,12 +683,17 @@ func (dm *daemon) passRoot(ctx context.Context, s *session, settleFor time.Durat
 			return false, false, err
 		}
 	}
+	if l.run.Changes() {
+		n := len(pendingFrom(l, "", time.Now()).Files)
+		dm.st.set("uploading", count(n, "change", "changes"))
+	}
 	start := time.Now()
 	res, err := runLater(ctx, dm.log, l, dm.d, db)
 	if err != nil {
 		return false, false, err
 	}
 	dm.report(s.root.Name, res, start)
+	dm.afterSync(ctx, s.root.Name, res, db)
 	if len(l.hold) > 0 {
 		files := 0
 		for _, a := range l.hold {
@@ -554,8 +717,7 @@ func (dm *daemon) checkQuota(ctx context.Context, upload int64) error {
 		return err
 	}
 	if acc.Limit > 0 && upload > acc.Limit-acc.Usage {
-		return fmt.Errorf("Google Drive is full: this needs %s but %s is free. Free up space in Drive, Gmail or Photos "+
-			"(they share the storage)", humanBytes(upload), humanBytes(max(acc.Limit-acc.Usage, 0)))
+		return &quotaError{need: upload, free: max(acc.Limit-acc.Usage, 0)}
 	}
 	return nil
 }

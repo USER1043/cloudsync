@@ -61,6 +61,10 @@ type Options struct {
 	// called from parallel workers.
 	Trash func(path string) error
 
+	// Explain, if set, turns a file's failure into the reason recorded in
+	// Result.Failed and the log, such as plain words for a network error.
+	Explain func(error) string
+
 	// Progress, if set, is called when transfers start, as bytes move (at
 	// most every 200ms) and after each transfer finishes. Calls never overlap.
 	Progress func(Progress)
@@ -85,6 +89,7 @@ type Result struct {
 	Bytes                                            int64
 	Failed                                           []filter.Issue
 	Waiting                                          []filter.Issue // left for the next run (reconcile.Wait)
+	Conflicted                                       []string       // files edited on both sides; both copies were kept
 }
 
 // FirstSync carries out a plan from plan.FirstSync. It never deletes or
@@ -157,6 +162,9 @@ func execute(ctx context.Context, r Remote, db *state.DB, opt Options, scan *loc
 	}
 	if opt.Trash == nil {
 		opt.Trash = trash.Move
+	}
+	if opt.Explain == nil {
+		opt.Explain = error.Error
 	}
 	s := &run{
 		ctx: ctx, r: r, db: db, opt: opt, now: time.Now(),
@@ -452,13 +460,14 @@ func (s *run) do(a reconcile.Action) {
 	s.doneBytes += moved(a)
 	defer s.report()
 	if err != nil {
-		s.res.Failed = append(s.res.Failed, filter.Issue{Rel: a.Rel, Reason: err.Error()})
+		reason := s.opt.Explain(err)
+		s.res.Failed = append(s.res.Failed, filter.Issue{Rel: a.Rel, Reason: reason})
 		if s.ctx.Err() != nil {
 			// Interrupted, not broken: the next run picks it up.
 			fmt.Fprintf(s.opt.Log, "[%d/%d] stopped  %s %s\n", s.done, s.total, verb(a), a.Rel)
 			return
 		}
-		fmt.Fprintf(s.opt.Log, "[%d/%d] FAILED %s %s: %v\n", s.done, s.total, verb(a), a.Rel, err)
+		fmt.Fprintf(s.opt.Log, "[%d/%d] FAILED %s %s: %s\n", s.done, s.total, verb(a), a.Rel, reason)
 		return
 	}
 	switch did {
@@ -468,6 +477,7 @@ func (s *run) do(a reconcile.Action) {
 		s.res.Downloaded++
 	case reconcile.Conflict:
 		s.res.Conflicts++
+		s.res.Conflicted = append(s.res.Conflicted, a.Rel)
 	case reconcile.TrashLocal:
 		s.res.Trashed++
 	case reconcile.TrashRemote:

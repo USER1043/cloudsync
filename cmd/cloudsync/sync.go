@@ -120,7 +120,7 @@ func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matc
 
 	start := time.Now()
 	fmt.Fprintln(w)
-	opt := engine.Options{Root: root.Name, Local: in.local, RootID: rootID, Label: osLabel(), Log: w, Names: names}
+	opt := engine.Options{Root: root.Name, Local: in.local, RootID: rootID, Label: osLabel(), Log: w, Names: names, Explain: describe}
 	if f, ok := w.(*os.File); ok {
 		if bar := newProgressBar(f); bar != nil {
 			opt.Log, opt.Progress = bar, bar.Update
@@ -147,6 +147,9 @@ func syncRoot(ctx context.Context, w io.Writer, root config.Root, m *filter.Matc
 		return fmt.Errorf("%d files could not be synced; fix the reasons above and run `cloudsync sync` again", len(res.Failed))
 	}
 	if err := db.SetMeta(ctx, metaFirstSync+root.Name, time.Now().Format(time.RFC3339)); err != nil {
+		return err
+	}
+	if err := db.SetMeta(ctx, metaLastCheck+root.Name, time.Now().Format(time.RFC3339)); err != nil {
 		return err
 	}
 	fmt.Fprintf(w, "First sync of %s complete.\n", root.Name)

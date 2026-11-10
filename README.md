@@ -111,6 +111,7 @@ already in Drive stays there and simply stops syncing.
 | `cloudsync sync [--yes]` | The first time: uploads local-only files, downloads Drive-only files, and keeps both copies of files that differ; never deletes or overwrites. After that: a two-way sync of edits, new files and deletes (to the Trash / Recycle Bin or Drive's trash), keeping both copies when a file was edited on both sides. Safe to re-run after an interruption |
 | `cloudsync deletes [approve\|cancel]` | Shows the deletes the big-delete guard is holding (more than 50 files or 10% of the folder at once); `approve` lets them go ahead, `cancel` puts the files back |
 | `cloudsync run` | Keeps syncing: catches up with Drive at start (as `sync --yes`, holding big deletes for you), then uploads local changes a few seconds after they settle. Drive is checked again at the next start or `sync`. Ctrl-C uploads the last changes and stops. Needs the first sync done |
+| `cloudsync status` | Whether `cloudsync run` is going, when Drive was last checked, what's waiting to upload, held deletes, and recent warnings |
 | `cloudsync logout` | Revokes the token with Google and removes it |
 
 ### When Drive is checked (a deliberate trade-off)
@@ -137,6 +138,26 @@ boot or login), or when you run `cloudsync sync` by hand.
   `cloudsync run`. Checking Drive while running (every few minutes, on wake
   from sleep and when the network returns) would be a small change; it isn't
   built because its author doesn't need it.
+
+### Notifications
+
+`cloudsync run` stays quiet while things work. It shows a desktop
+notification (KDE/GNOME on Linux; a CloudSync icon in the Windows taskbar)
+only for:
+
+- another computer that shut down before uploading everything (which files
+  are out of date here);
+- deletes held by the big-delete guard, waiting for `cloudsync deletes`;
+- a file edited in two places (both versions are kept);
+- files that keep failing for a reason on this computer (permissions, a
+  file open in another program, a full disk, a path too long for Windows);
+- Drive full, or the sign-in expired (`cloudsync login`), or the Drive
+  folder missing; CloudSync pauses or stops until you fix it;
+- no connection to Google Drive for 30 minutes, or Google's servers failing
+  for 10 minutes (with a link to Google's status page; not your setup).
+
+The same message isn't repeated within an hour, and warnings disappear once
+their problem is gone. `cloudsync status` lists recent ones.
 
 ### At shutdown
 

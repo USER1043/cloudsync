@@ -77,9 +77,24 @@ design for that limit, including quota checks.
 
 ### Where we left off (2026-11-10): give the owner this when they ask
 
-Phase 3 (background service), step 3 of 6 committed (`e6c2d72`, not
-pushed); **step 4 (shutdown) built and tested with a real shutdown
-2026-11-10, waiting for the owner's go-ahead to commit.**
+Phase 3 (background service), steps 3 and 4 committed and pushed
+(`e6c2d72`, `de002b2`); **step 5 (notifications, plain-language errors,
+`cloudsync status`) built and live-tested 2026-11-10.** Next: step 6,
+start at login.
+
+- **Step 5 (decided with the owner 2026-11-10):** notifications only for
+  what needs the owner or that they'd want to know (stale files from
+  another computer, held deletes, conflicts, files failing for a local
+  reason, Drive full, sign-in, root folder, offline **30+ min**, Google
+  failing **10+ min**); never for routine syncs, retries or rate limits.
+  Same message at most once an hour; resolved problems take their
+  notification down. Linux: freedesktop notifications on the session bus.
+  Windows: a **tray icon** (owner agreed) whose balloons show as
+  notifications; untested on Windows. `cloudsync status` added (owner
+  agreed). Live-tested with A as a systemd user unit: conflict, held
+  deletes and an unreadable file notified with no errors (the owner saw
+  them in KDE and confirmed they looked right); `status` showed
+  them and they cleared once fixed; a second `run` is refused.
 
 - **Works now:** two-way `cloudsync plan`/`sync`, the big-delete guard with
   `cloudsync deletes` (`approve`/`cancel`), and `cloudsync run`: catch-up
@@ -207,10 +222,11 @@ Packages:
 
 | Package | Role |
 |---|---|
-| `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`, `deletes`; terminal progress bar (`progress.go`). `plan`/`sync` use `plan.FirstSync` until a root's first sync is done, then `twoway.go`: `planLater` (root-folder checks, `reconcile.Reconcile` with `Skips`, `Gate`), `syncLater`/`runLater` (delete log, held deletes, `engine.Sync`). `deletes approve`/`cancel` run a full sync with that answer, so held deletes are re-checked first. `run.go`: `cloudsync run` (catch-up per root with retries, then a loop: `internal/watch` signal → `schedule` (3 s quiet, 30 s cap) → live pass; hourly rescan; flush at exit; `fatal` vs retried errors). `live.go`: `planLive` rescans and reconciles against the state DB standing in for Drive (`treeFromBase`), so a live pass only uploads or trashes in Drive; it skips held deletes, files changed in the last 2 s and the `session`'s unsynced Drive paths, and its held deletes join the pending question (`later.live`). `openState` waits for another process's lock |
+| `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`, `deletes`; terminal progress bar (`progress.go`). `plan`/`sync` use `plan.FirstSync` until a root's first sync is done, then `twoway.go`: `planLater` (root-folder checks, `reconcile.Reconcile` with `Skips`, `Gate`), `syncLater`/`runLater` (delete log, held deletes, `engine.Sync`). `deletes approve`/`cancel` run a full sync with that answer, so held deletes are re-checked first. `run.go`: `cloudsync run` (catch-up per root with retries, then a loop: `internal/watch` signal → `schedule` (3 s quiet, 30 s cap) → live pass; hourly rescan; flush at exit; `fatal` vs retried errors). `live.go`: `planLive` rescans and reconciles against the state DB standing in for Drive (`treeFromBase`), so a live pass only uploads or trashes in Drive; it skips held deletes, files changed in the last 2 s and the `session`'s unsynced Drive paths, and its held deletes join the pending question (`later.live`). `openState` waits for another process's lock. `errors.go`: `classify`/`describe` turn errors into plain words with a fix (offline, Google failing, rate limit, sign-in, Drive full, root folder, local file problems); used for logs, `main`'s errors and `engine.Options.Explain`. `status.go`: `statusKeeper` writes `status.json` in the state folder (state, detail, recent warnings), `run.lock` marks `run` as running (one instance), `cloudsync status`. In `run.go`, `alert`/`resolve`, `trouble`/`recovered` (quiet until offline 30 min or failing 10 min), `afterSync` (held deletes, conflicts, failing files) |
 | `internal/config` | `config.toml` load/write/validate, `ParseSize`, per-OS dirs. No built-in default root: a missing config returns `ErrNoConfig` |
 | `internal/auth` | OAuth loopback + PKCE, token in OS keyring, refreshed tokens saved back |
 | `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, `Update` in place (refuses with `ErrChanged` if Drive's copy isn't the last-synced checksum), `Trash`, `HasChildren`, downloads, `Retry` (backoff on 429/5xx/rate-limit 403/network; never on a refused sign-in), `Temporary`, `SignInRejected`, `Stat`, `countingTransport` for upload progress, `Tree.Filter` |
+| `internal/notify` | Desktop notifications with no repeats (same key and text at most once an hour; a new message replaces its key's last one; `Clear` when the problem is gone; nil `*Notifier` is a no-op). Linux: `org.freedesktop.Notifications` on the session bus (critical ones stay until dismissed). Windows: tray icon (`Shell_NotifyIconW`) on a hidden window; balloons show as notifications |
 | `internal/shutdown` | Hears a shutdown as early as the system allows: `Hooks.Starting` (save the unsynced-files list), `Holding` (Windows only: the reason to hold, or ""), `Ending` (Windows `WM_ENDSESSION`). Linux: logind **delay** inhibitor (never block: KDE gives no message for a blocked shutdown) and `PrepareForShutdown`, matched only from logind. Windows: hidden top-level window on a locked thread. Sleep is never touched |
 | `internal/watch` | Signals "something changed" under a root, never what (callers rescan, so a lost or merged event can't lose an edit). Linux: fsnotify (inotify) per folder, folder list refreshed after each pass. Windows: one recursive `ReadDirectoryChangesW` on the root, so subfolders stay renamable |
 | `internal/filter` | gitignore-style `Matcher` (last match wins, `!`, anchored `/x/`, `**`, case-insensitive), `.cloudsyncignore`, size limit, `CheckName` for names no system can sync |
@@ -234,6 +250,9 @@ solved entries. The repo is public: no real file names from the synced folder.
 
 ## Gotchas found so far
 
+- A bare `syscall.Errno` (e.g. "no space left on device") satisfies
+  `net.Error`, so "is it a network error?" must look for `*url.Error`,
+  `*net.OpError` or `*net.DNSError`, and check `*fs.PathError` first.
 - Drive stores `modifiedTime` to **millisecond** precision, while NTFS keeps
   100 ns. Compare mtimes truncated to ms, or rely on MD5.
 - `go-api` reads small upload bodies into memory before sending, which is
