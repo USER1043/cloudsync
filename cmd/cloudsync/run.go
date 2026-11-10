@@ -40,7 +40,7 @@ const (
 )
 
 var errNoFirstSync = errors.New("this folder hasn't had its first sync yet. Run `cloudsync sync` once first " +
-	"(it shows what it will do and asks), then start `cloudsync run`")
+	"(it shows what it will do and asks), then `cloudsync start`")
 
 // daemon is `cloudsync run`: a catch-up with Drive at start, then live
 // passes that upload local changes as they happen.
@@ -73,11 +73,23 @@ type daemon struct {
 
 func runRun(ctx context.Context, args []string) error {
 	fl := flag.NewFlagSet("run", flag.ContinueOnError)
+	toFile := fl.Bool("log-file", false, "write the log to "+logFileName+" in the state folder instead of the terminal")
+	// For the Windows background copy, whose Startup entry can't set
+	// environment variables: the same as CLOUDSYNC_CONFIG and
+	// CLOUDSYNC_STATE_DIR.
+	cfgFile := fl.String("config", "", "use this config file")
+	stateDir := fl.String("state-dir", "", "use this state folder")
 	if err := fl.Parse(args); err != nil {
 		return err
 	}
 	if fl.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q", fl.Arg(0))
+	}
+	if *cfgFile != "" {
+		os.Setenv("CLOUDSYNC_CONFIG", *cfgFile)
+	}
+	if *stateDir != "" {
+		os.Setenv("CLOUDSYNC_STATE_DIR", *stateDir)
 	}
 	e, err := loadEnv()
 	if err != nil {
@@ -99,6 +111,15 @@ func runRun(ctx context.Context, args []string) error {
 		return err
 	}
 	defer unlock()
+	var out io.Writer = os.Stdout
+	if *toFile {
+		lf, err := openLogFile(dir)
+		if err != nil {
+			return err
+		}
+		defer lf.Close()
+		out = lf
+	}
 	d, err := e.drive(ctx)
 	if err != nil {
 		return err
@@ -111,12 +132,16 @@ func runRun(ctx context.Context, args []string) error {
 	ctx, stop := context.WithCancel(ctx)
 	defer stop()
 	dm := &daemon{
-		cfg: e.cfg, m: m, d: d, log: newLogWriter(os.Stdout), w: w,
+		cfg: e.cfg, m: m, d: d, log: newLogWriter(out), w: w,
 		stop: stop, done: make(chan struct{}), stopping: make(chan struct{}, 1), listed: map[*session]bool{},
 		st: newStatusKeeper(dir),
 	}
 	defer close(dm.done)
-	dm.logf("CloudSync %s started (config %s).", version, e.cfg.Path())
+	dm.logf("CloudSync %s started (config %s).", buildVersion(), e.cfg.Path())
+	if p, err := place(); err == nil {
+		// `cloudsync stop` and `update` on Windows; Linux uses SIGTERM.
+		watchStopRequests(ctx, p, stop)
+	}
 	if dm.notes, err = notify.New(); err != nil {
 		dm.logf("Desktop notifications aren't available (%v); warnings go to this log and `cloudsync status` only.", err)
 	} else {
@@ -144,7 +169,7 @@ func runRun(ctx context.Context, args []string) error {
 		// Only the owner can fix these; say so where they'll see it.
 		msg := describe(err)
 		if classify(err) == kindSignIn {
-			msg += ", then start `cloudsync run` again"
+			msg += ", then `cloudsync start`"
 		}
 		dm.st.set("stopped: needs you", msg)
 		dm.alert(notify.Message{Key: "stopped", Title: "CloudSync stopped syncing", Body: msg, Critical: true})

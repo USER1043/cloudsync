@@ -80,7 +80,7 @@ func TestPrintRunState(t *testing.T) {
 	}
 	b.Reset()
 	printRunState(&b, st, false, now)
-	if out := b.String(); !strings.Contains(out, "not running") || !strings.Contains(out, "cloudsync run") {
+	if out := b.String(); !strings.Contains(out, "not running") || !strings.Contains(out, "cloudsync start") {
 		t.Errorf("stopped output = %q", out)
 	}
 }

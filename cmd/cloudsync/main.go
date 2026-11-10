@@ -43,6 +43,12 @@ Commands:
             for what needs you (held deletes, conflicts, sign-in, Drive full).
   status    Show whether run is going, when Drive was last checked, what is
             waiting to upload, held deletes and recent warnings
+  start     Keep CloudSync running in the background from now on: installs
+            this program (once), starts it at every login, and starts it now
+  stop      Stop it and don't start it at login any more (files, settings
+            and sign-in are kept; start turns it back on)
+  update    Replace the installed program with this build and restart it;
+            goes back to the previous version if the new one doesn't start
   version   Print the version
 `
 
@@ -56,6 +62,10 @@ func main() {
 	stop()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", describe(err))
+		if fatal(err) {
+			// Only the owner can fix it; tells systemd not to restart `run`.
+			os.Exit(exitNeedsOwner)
+		}
 		os.Exit(1)
 	}
 }
@@ -80,8 +90,14 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runRun(ctx, args)
 	case "status":
 		return runStatusCmd(ctx, args)
+	case "start":
+		return runStart(ctx, args)
+	case "stop":
+		return runStop(ctx, args)
+	case "update":
+		return runUpdate(ctx, args)
 	case "version":
-		fmt.Println("cloudsync", version)
+		fmt.Println("cloudsync", buildVersion())
 		return nil
 	case "help", "-h", "--help":
 		fmt.Print(usageText)

@@ -208,13 +208,13 @@ func printRunState(w io.Writer, st runStatus, running bool, now time.Time) {
 			fmt.Fprintf(w, "  %s\n", st.Detail)
 		}
 	case !st.Updated.IsZero():
-		fmt.Fprintf(w, "CloudSync is not running in the background; it last ran %s (%s).\n", when(st.Updated, now), st.State)
+		fmt.Fprintf(w, "CloudSync is not running in the background. Last seen %s: %s.\n", when(st.Updated, now), st.State)
 		if st.Detail != "" {
 			fmt.Fprintf(w, "  %s\n", st.Detail)
 		}
-		fmt.Fprintln(w, "Start it with `cloudsync run`.")
+		fmt.Fprintln(w, "Turn it on with `cloudsync start`.")
 	default:
-		fmt.Fprintln(w, "CloudSync is not running in the background. Start it with `cloudsync run`.")
+		fmt.Fprintln(w, "CloudSync is not running in the background. Turn it on with `cloudsync start`.")
 	}
 }
 

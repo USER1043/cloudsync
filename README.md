@@ -6,11 +6,13 @@ one OS runs at a time, and works the same for any set of Windows and Linux
 computers. Synced files are also reachable from a phone through the Google
 Drive app.
 
-**Status:** Phase 3 in progress. Sign-in, setup, dry run, the first sync on
+**Status:** Phase 3 nearly done. Sign-in, setup, dry run, the first sync on
 each computer, two-way sync (edits and deletes both ways, with a big-delete
-guard) and `cloudsync run`, which catches up with Drive at start and then
-uploads local changes as they happen. Still to come: holding shutdown while
-uploads are pending, notifications, and starting at login.
+guard), and a background sync that starts at login (`cloudsync start`),
+catches up with Drive, uploads local changes as they happen, finishes its
+uploads at shutdown and notifies you only when something needs you. The
+Windows side of the background sync (Startup entry, tray icon, shutdown
+screen) is built but not yet tested on Windows.
 
 ## Set it up yourself
 
@@ -58,11 +60,19 @@ cloudsync login     # opens Google sign-in; "unverified app" is expected: Advanc
 cloudsync init      # pick the folder to sync and its Drive folder
 cloudsync plan      # dry run: shows exactly what will happen
 cloudsync sync      # first sync
+cloudsync start     # from now on, sync in the background, starting at every login
 ```
 
 `init` suggests `~/CloudSync` and `CloudSync/<folder name>` in Drive; both
 can be anything. Run `login` before `init` so `init` can show folders that
 already exist in Drive.
+
+`start` copies the program to a fixed place (`~/.local/bin/cloudsync` on
+Linux, `%LocalAppData%\Programs\CloudSync` on Windows), sets it to start at
+login (a systemd user service on Linux; a Startup entry on Windows, which
+Task Manager's *Startup apps* lists) and starts it now. You only run it once
+per computer. After building a newer version, run `cloudsync update` from
+the new build; `cloudsync stop` turns the background sync off.
 
 ### 4. On the second computer (or the other OS)
 
@@ -110,8 +120,11 @@ already in Drive stays there and simply stops syncing.
 | `cloudsync plan [--all]` | Dry run: what the next sync would upload, download, trash, skip or flag. Changes nothing |
 | `cloudsync sync [--yes]` | The first time: uploads local-only files, downloads Drive-only files, and keeps both copies of files that differ; never deletes or overwrites. After that: a two-way sync of edits, new files and deletes (to the Trash / Recycle Bin or Drive's trash), keeping both copies when a file was edited on both sides. Safe to re-run after an interruption |
 | `cloudsync deletes [approve\|cancel]` | Shows the deletes the big-delete guard is holding (more than 50 files or 10% of the folder at once); `approve` lets them go ahead, `cancel` puts the files back |
-| `cloudsync run` | Keeps syncing: catches up with Drive at start (as `sync --yes`, holding big deletes for you), then uploads local changes a few seconds after they settle. Drive is checked again at the next start or `sync`. Ctrl-C uploads the last changes and stops. Needs the first sync done |
-| `cloudsync status` | Whether `cloudsync run` is going, when Drive was last checked, what's waiting to upload, held deletes, and recent warnings |
+| `cloudsync start` | Keeps CloudSync syncing in the background from now on: installs the program (the first time), starts it at every login, and starts it now. Needs the first sync done |
+| `cloudsync stop` | Stops the background sync (after its last uploads) and doesn't start it at login any more. Files, settings and sign-in are kept |
+| `cloudsync update` | Run from a newer build: replaces the installed program, restarts the background sync on it, and goes back to the previous version if the new one doesn't start |
+| `cloudsync run` | The background sync itself, in the terminal: catches up with Drive at start (as `sync --yes`, holding big deletes for you), then uploads local changes a few seconds after they settle. Ctrl-C uploads the last changes and stops. `start` runs this for you |
+| `cloudsync status` | Whether the background sync is going, when Drive was last checked, what's waiting to upload, held deletes, and recent warnings |
 | `cloudsync logout` | Revokes the token with Google and removes it |
 
 ### When Drive is checked (a deliberate trade-off)
@@ -200,11 +213,15 @@ their problem is gone. `cloudsync status` lists recent ones.
 |---|---|---|
 | `config.toml`, `client_secret.json` | `%AppData%\cloudsync` | `~/.config/cloudsync` |
 | Sign-in token | Credential Manager | Secret Service keyring |
-| Sync records (`state.db`) | `%LocalAppData%\cloudsync` | `~/.local/state/cloudsync` |
+| Sync records (`state.db`), `status.json` | `%LocalAppData%\cloudsync` | `~/.local/state/cloudsync` |
+| Installed program (`cloudsync start`) | `%LocalAppData%\Programs\CloudSync` | `~/.local/bin/cloudsync` |
+| Background sync's log | `%LocalAppData%\cloudsync\cloudsync.log` | `journalctl --user -u cloudsync` |
+| Started at login by | Startup entry `CloudSync` (Task Manager → Startup apps) | `~/.config/systemd/user/cloudsync.service` |
 
 To try CloudSync against a scratch folder without touching your real setup,
 point `CLOUDSYNC_CONFIG` at another `config.toml` and `CLOUDSYNC_STATE_DIR`
-at another folder.
+at another folder. `cloudsync start` then installs a separate copy into that
+folder with its own service name, so it never replaces the real one.
 
 ## License
 

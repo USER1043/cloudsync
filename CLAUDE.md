@@ -77,11 +77,34 @@ design for that limit, including quota checks.
 
 ### Where we left off (2026-11-10): give the owner this when they ask
 
-Phase 3 (background service), steps 3 and 4 committed and pushed
-(`e6c2d72`, `de002b2`); **step 5 (notifications, plain-language errors,
-`cloudsync status`) built and live-tested 2026-11-10.** Next: step 6,
-start at login.
+Phase 3 (background service), steps 3–5 committed and pushed (`e6c2d72`,
+`de002b2`, `3d3a173`); **step 6 (start at login: `cloudsync start`,
+`stop`, `update`) built and live-tested on scratch 2026-11-10, and
+switched on for real on Fedora the same day** (the owner approved after
+`plan` showed 1 file to upload): `~/.local/bin/cloudsync`,
+`cloudsync.service` enabled and active; its catch-up took 2 min (mostly
+the Drive listing), uploaded that file, and it now watches `~/My_Files`.
+Fedora syncs automatically from here on. The installed build is
+`3d3a173-modified` (built before step 6 was committed); after committing,
+rebuild and run `bin/cloudsync update` to get a clean version.
 
+- **Step 6 (decided with the owner 2026-11-10):** commands `start` (was
+  "install"; installs the program once, registers it to start at login,
+  starts it; idempotent; never replaces the installed copy), `stop` (was
+  "uninstall"; stops after the flush and removes the login entry, keeps the
+  program file) and `update` (a separate command, run from the new build:
+  refuses if not installed or run from the installed copy; "already up to
+  date" if identical; stops, keeps `.previous`, starts and checks it runs,
+  else restores the previous one). Versions come from git (`buildVersion`).
+  Linux: `~/.local/bin/cloudsync` + systemd user unit tied to
+  `graphical-session.target`, `Restart=on-failure`, exit status 3 (needs
+  the owner) not restarted. Windows (owner agreed): per-user **Startup
+  entry** (HKCU Run) instead of Task Scheduler (no admin), a windowless
+  copy (PE subsystem patched, like `editbin`), a log file, stop via a named
+  event; untested on Windows. Scratch configs get their own unit name and
+  program copy (`place`). Live-tested on scratch: start, start again,
+  update (same build, new build, broken build → fallback, no restart loop),
+  live upload under the service, stop, stop again.
 - **Step 5 (decided with the owner 2026-11-10):** notifications only for
   what needs the owner or that they'd want to know (stale files from
   another computer, held deletes, conflicts, files failing for a local
@@ -123,9 +146,10 @@ start at login.
   The Windows half (window, hold reason) is untested until Windows.
 - **Real `MyFiles`:** first two-way sync on Fedora done and verified
   2026-11-10 (1,426 files in sync); `cloudsync run` not tried on it yet.
-- **Not yet:** notifications and polished errors (step 5), start at login
-  (step 6: systemd user unit with `TimeoutStopSec=45`, Windows logon task
-  built with `-H windowsgui`), then the Windows catch-up.
+- **Not yet:** the Windows catch-up (rebuild `C:\MyFiles`' state, let the
+  new build reconcile the old layout; see "Windows follow-up" below), and
+  testing every Windows-only part there: watcher, Recycle Bin, shutdown
+  screen, tray notifications, Startup entry, windowless copy, log file.
 
 | Phase | State |
 |---|---|
@@ -226,6 +250,7 @@ Packages:
 | `internal/config` | `config.toml` load/write/validate, `ParseSize`, per-OS dirs. No built-in default root: a missing config returns `ErrNoConfig` |
 | `internal/auth` | OAuth loopback + PKCE, token in OS keyring, refreshed tokens saved back |
 | `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, `Update` in place (refuses with `ErrChanged` if Drive's copy isn't the last-synced checksum), `Trash`, `HasChildren`, downloads, `Retry` (backoff on 429/5xx/rate-limit 403/network; never on a refused sign-in), `Temporary`, `SignInRejected`, `Stat`, `countingTransport` for upload progress, `Tree.Filter` |
+| `cmd/cloudsync` (setup) | `setup.go`: `start`/`stop`/`update`, `place` (usual vs scratch placement), `service` interface; `setup_linux.go` (systemd user unit), `setup_windows.go` (Startup entry, windowless copy, stop event, `run --log-file/--config/--state-dir`); `pe.go` (`makeWindowless`); `logfile.go` (rotating log, 5 MB + 1 old); `version.go` (git commit as version) |
 | `internal/notify` | Desktop notifications with no repeats (same key and text at most once an hour; a new message replaces its key's last one; `Clear` when the problem is gone; nil `*Notifier` is a no-op). Linux: `org.freedesktop.Notifications` on the session bus (critical ones stay until dismissed). Windows: tray icon (`Shell_NotifyIconW`) on a hidden window; balloons show as notifications |
 | `internal/shutdown` | Hears a shutdown as early as the system allows: `Hooks.Starting` (save the unsynced-files list), `Holding` (Windows only: the reason to hold, or ""), `Ending` (Windows `WM_ENDSESSION`). Linux: logind **delay** inhibitor (never block: KDE gives no message for a blocked shutdown) and `PrepareForShutdown`, matched only from logind. Windows: hidden top-level window on a locked thread. Sleep is never touched |
 | `internal/watch` | Signals "something changed" under a root, never what (callers rescan, so a lost or merged event can't lose an edit). Linux: fsnotify (inotify) per folder, folder list refreshed after each pass. Windows: one recursive `ReadDirectoryChangesW` on the root, so subfolders stay renamable |
