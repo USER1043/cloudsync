@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"syscall"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -34,6 +35,11 @@ Commands:
             10% of a folder at once)
             approve  let them go ahead     cancel  put the files back
             --all  list every held delete  --yes  don't ask for confirmation
+  run       Keep syncing in the background: catch up with Drive first (as
+            sync --yes does, holding big deletes for you), then upload local
+            changes a few seconds after they happen. Drive is checked again
+            at the next start or sync. Ctrl-C uploads the last changes and
+            stops. Needs a first sync with sync.
   version   Print the version
 `
 
@@ -42,7 +48,7 @@ func main() {
 		fmt.Fprint(os.Stderr, usageText)
 		os.Exit(2)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	err := run(ctx, os.Args[1], os.Args[2:])
 	stop()
 	if err != nil {
@@ -67,6 +73,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runSync(ctx, args)
 	case "deletes":
 		return runDeletes(ctx, args)
+	case "run":
+		return runRun(ctx, args)
 	case "version":
 		fmt.Println("cloudsync", version)
 		return nil

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	"golang.org/x/oauth2"
 	"google.golang.org/api/googleapi"
 )
 
@@ -35,8 +36,19 @@ func Retry(ctx context.Context, op func() error) error {
 	}
 }
 
+// Temporary reports whether err is likely to clear up on its own: the
+// network is down, or Google is overloaded or rate-limiting.
+func Temporary(err error) bool { return retryable(err) }
+
+// SignInRejected reports whether Google refused the stored sign-in, because
+// it expired or was revoked. Only `cloudsync login` fixes that.
+func SignInRejected(err error) bool {
+	var re *oauth2.RetrieveError
+	return errors.As(err, &re) && (re.Response == nil || re.Response.StatusCode < 500)
+}
+
 func retryable(err error) bool {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || SignInRejected(err) {
 		return false
 	}
 	var ge *googleapi.Error

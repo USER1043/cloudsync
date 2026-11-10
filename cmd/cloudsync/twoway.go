@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +27,23 @@ type later struct {
 	held    map[string]reconcile.Op
 	pending bool               // an earlier run's deletes are waiting for the owner
 	decided reconcile.Decision // the owner's answer to them, for this run
+
+	// live marks a pass of `cloudsync run` after its catch-up, which sees
+	// only local changes. It leaves the deletes held earlier (heldItems)
+	// alone and adds any it holds itself to them.
+	live      bool
+	heldItems []state.HeldDelete
+}
+
+// rootError is a problem with a root's Drive folder that only the owner can
+// sort out. CloudSync stops rather than guess.
+type rootError struct{ msg string }
+
+func (e *rootError) Error() string { return e.msg }
+
+func rootMissing(where string) error {
+	return &rootError{fmt.Sprintf("the Drive folder %s is missing or in Drive's trash. If it was deleted by mistake, restore it "+
+		"from Drive's trash (drive.google.com, Trash) and run this again. CloudSync stops rather than upload everything again", where)}
 }
 
 // planLater compares in with the state DB's record of the last sync and
@@ -39,11 +57,10 @@ func planLater(ctx context.Context, in *inspection, db *state.DB, d reconcile.De
 	where := "My Drive/" + strings.Join(in.root.RemoteSegments(), "/")
 	switch {
 	case in.rootID == "":
-		return nil, fmt.Errorf("the Drive folder %s is missing. If it was deleted by mistake, restore it from Drive's trash "+
-			"(drive.google.com, Trash) and run this again. CloudSync stops rather than upload everything again", where)
+		return nil, rootMissing(where)
 	case stored != "" && stored != in.rootID:
-		return nil, fmt.Errorf("the Drive folder %s is not the one this computer synced with (it was replaced or recreated). "+
-			"CloudSync stops rather than guess; restore the original folder from Drive's trash, or ask for help resetting this root", where)
+		return nil, &rootError{fmt.Sprintf("the Drive folder %s is not the one this computer synced with (it was replaced or recreated). "+
+			"CloudSync stops rather than guess; restore the original folder from Drive's trash, or ask for help resetting this root", where)}
 	}
 
 	base, err := db.Items(ctx, in.root.Name)
@@ -228,6 +245,7 @@ func runLater(ctx context.Context, w io.Writer, l *later, d *gdrive.Client, db *
 	// that no longer needs to hold anything supersedes it.
 	var err error
 	switch {
+	case l.live:
 	case l.pending && l.decided == reconcile.Approve:
 		err = db.ResolveDeletes(ctx, root, state.DeletesApproved, now)
 	case l.pending && l.decided == reconcile.Cancel:
@@ -240,12 +258,17 @@ func runLater(ctx context.Context, w io.Writer, l *later, d *gdrive.Client, db *
 	}
 	if len(l.hold) > 0 {
 		ev := state.DeleteEvent{At: now, Root: root, OS: osLabel(), Files: l.plan.BaseFiles}
-		items := make([]state.HeldDelete, len(l.hold))
-		for i, a := range l.hold {
-			items[i] = state.HeldDelete{Rel: a.Rel, Here: a.Op == reconcile.TrashLocal, Dir: a.Dir, DriveID: a.DriveID, Size: a.Size}
+		var items []state.HeldDelete
+		if l.live {
+			items = slices.Clone(l.heldItems)
+		}
+		for _, a := range l.hold {
+			items = append(items, state.HeldDelete{Rel: a.Rel, Here: a.Op == reconcile.TrashLocal, Dir: a.Dir, DriveID: a.DriveID, Size: a.Size})
+		}
+		for _, it := range items {
 			switch {
-			case a.Dir:
-			case a.Op == reconcile.TrashLocal:
+			case it.Dir:
+			case it.Here:
 				ev.Local++
 			default:
 				ev.Remote++

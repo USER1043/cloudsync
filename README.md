@@ -6,9 +6,11 @@ one OS runs at a time, and works the same for any set of Windows and Linux
 computers. Synced files are also reachable from a phone through the Google
 Drive app.
 
-**Status:** Phase 2. Sign-in, setup, dry run and the one-time first sync on
-each computer. Continuous two-way sync (a background service that also syncs
-deletes and handles shutdown) is Phase 3.
+**Status:** Phase 3 in progress. Sign-in, setup, dry run, the first sync on
+each computer, two-way sync (edits and deletes both ways, with a big-delete
+guard) and `cloudsync run`, which catches up with Drive at start and then
+uploads local changes as they happen. Still to come: holding shutdown while
+uploads are pending, notifications, and starting at login.
 
 ## Set it up yourself
 
@@ -105,9 +107,36 @@ already in Drive stays there and simply stops syncing.
 | `cloudsync login` | Signs in through the browser and stores the token in Windows Credential Manager or the Linux keyring (KWallet / GNOME Keyring) |
 | `cloudsync whoami` | Shows the signed-in account and Drive storage |
 | `cloudsync init` | Chooses the folder to sync and its Drive folder, and writes `config.toml`. Flags: `--local`, `--remote`, `--max-file-size`, `--force` |
-| `cloudsync plan [--all]` | Dry run: what the first sync would upload, download, skip or flag. Changes nothing |
-| `cloudsync sync [--yes]` | First sync: uploads local-only files, downloads Drive-only files, and keeps both copies of files that differ. Never deletes or overwrites; safe to re-run after an interruption |
+| `cloudsync plan [--all]` | Dry run: what the next sync would upload, download, trash, skip or flag. Changes nothing |
+| `cloudsync sync [--yes]` | The first time: uploads local-only files, downloads Drive-only files, and keeps both copies of files that differ; never deletes or overwrites. After that: a two-way sync of edits, new files and deletes (to the Trash / Recycle Bin or Drive's trash), keeping both copies when a file was edited on both sides. Safe to re-run after an interruption |
+| `cloudsync deletes [approve\|cancel]` | Shows the deletes the big-delete guard is holding (more than 50 files or 10% of the folder at once); `approve` lets them go ahead, `cancel` puts the files back |
+| `cloudsync run` | Keeps syncing: catches up with Drive at start (as `sync --yes`, holding big deletes for you), then uploads local changes a few seconds after they settle. Drive is checked again at the next start or `sync`. Ctrl-C uploads the last changes and stops. Needs the first sync done |
 | `cloudsync logout` | Revokes the token with Google and removes it |
+
+### When Drive is checked (a deliberate trade-off)
+
+`cloudsync run` sends your changes **up** to Drive within seconds, but it
+**checks Drive for changes made elsewhere only when it starts** (normally at
+boot or login), or when you run `cloudsync sync` by hand.
+
+- **What this means:** an edit made on your phone, or on another computer,
+  while this computer is running shows up here at the next start, not
+  straight away. Closing the lid to sleep isn't a start: a laptop that sleeps
+  for days without being shut down picks up those changes only at its next
+  boot or `cloudsync sync`.
+- **Why:** CloudSync was built for a dual-boot laptop that is shut down
+  often, where the phone is mostly for reading files, and where only one OS
+  runs at a time. There, checking once per boot is enough, and Drive is never
+  queried while you work.
+- **Nothing is lost either way:** if you edit a file here that was also
+  changed in Drive since the last check, CloudSync notices when it uploads
+  and keeps both copies (`name (conflict ...)`) instead of overwriting.
+- **If that doesn't fit how you work** (you edit on the phone a lot, or you
+  mostly sleep the computer instead of shutting it down), run
+  `cloudsync sync` when you want Drive's changes now, or restart
+  `cloudsync run`. Checking Drive while running (every few minutes, on wake
+  from sleep and when the network returns) would be a small change; it isn't
+  built because its author doesn't need it.
 
 ### How the first sync works
 

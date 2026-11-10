@@ -106,7 +106,7 @@ func runDeletes(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	db, closeState, err := openState()
+	db, closeState, err := openState(ctx, w)
 	if err != nil {
 		return err
 	}

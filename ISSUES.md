@@ -17,6 +17,7 @@ small uploads, Windows locking the running `.exe`) are recorded in
 | 4 | `client_secret.json` can be world-readable after copying | open |
 | 5 | Uploads slower than the connection allows | fixed |
 | 6 | A moved file is re-uploaded and its old copy trashed | open (by design until rename detection) |
+| 7 | An expired or revoked sign-in was retried like a network outage | fixed |
 
 ## 1. Names that Windows can't store are skipped
 
@@ -163,3 +164,22 @@ small uploads, Windows locking the running `.exe`) are recorded in
   follow-up: match a deleted path with a new one of the same size and MD5
   (locally) or the same Drive file ID (remotely), and move instead of
   upload + trash (`files.update` with new parents in Drive, a rename here).
+- **Also in live mode (2026-11-10):** `cloudsync run` uploads the moved
+  files and trashes the old copies a few seconds after a folder is renamed.
+  Renaming a folder of more than 50 files (or 10% of the root) trips the
+  guard, which then waits for `cloudsync deletes approve`.
+
+## 7. An expired or revoked sign-in was retried like a network outage
+
+- **Found:** 2026-11-10, while building `cloudsync run`'s error handling.
+- **Symptom (by code review):** when Google refuses the stored refresh
+  token, each Drive call is retried 6 times over about 30 s before failing,
+  and a long-running sync would keep retrying a sign-in that can't work.
+- **Cause:** the oauth2 transport returns the refusal
+  (`*oauth2.RetrieveError`) inside a `*url.Error`, and `*url.Error` is a
+  `net.Error`, which `gdrive.Retry` treats as a network problem.
+- **Fix:** `gdrive.SignInRejected` recognizes the refusal (any token-endpoint
+  answer below 500) and `Retry` gives up on it at once; `cloudsync run` stops
+  and says to run `cloudsync login`. `gdrive.Temporary` exposes the
+  remaining "retry later" cases. Tested with wrapped errors in
+  `retry_test.go`.

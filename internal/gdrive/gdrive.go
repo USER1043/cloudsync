@@ -321,6 +321,18 @@ func (c *Client) get(ctx context.Context, id string) (File, error) {
 	return out, nil
 }
 
+// Stat returns the file or folder id, with Trashed set if it is in the trash
+// or no longer exists.
+func (c *Client) Stat(ctx context.Context, id string) (File, error) {
+	var f File
+	err := Retry(ctx, func() error {
+		var err error
+		f, err = c.get(ctx, id)
+		return err
+	})
+	return f, err
+}
+
 // Trash moves the file or folder id to Drive's trash, from which the owner
 // can restore it for 30 days. Trashing a folder trashes everything inside,
 // so callers check HasChildren first. A file that is already gone is fine.

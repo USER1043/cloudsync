@@ -60,27 +60,34 @@ design for that limit, including quota checks.
 
 ### Where we left off (2026-11-10): give the owner this when they ask
 
-Phase 3 (background service), step 2 of 6 done: two-way sync by hand.
+Phase 3 (background service), step 3 of 6 done: `cloudsync run`.
 
 - **Works now:** after a folder's first sync, `cloudsync plan` shows and
   `cloudsync sync` carries out a two-way sync: edits, new files and
   deletes in both directions (deletes to the Trash/Recycle Bin or Drive's
   trash), keep-both conflicts. The big-delete guard holds more than 50
   files or 10%; `cloudsync deletes` shows them, `approve` runs them and
-  `cancel` puts the files back. Live-tested 2026-11-10 with two scratch
-  "computers" on `CloudSync-Test/TwoWay-1110`: in-place update kept the
-  Drive ID, trash both ways, guard hold, cancel, approve, conflict.
+  `cancel` puts the files back.
+- **`cloudsync run` (new):** catches up with Drive at start (as `sync
+  --yes`; held deletes wait for `cloudsync deletes`), then uploads local
+  changes ~3 s after they settle, and flushes the last changes on Ctrl-C or
+  SIGTERM. Offline at start: explains and retries (30 s doubling to 5 min).
+  Other commands still work while it runs (it takes the lock only while
+  syncing). Live-tested 2026-11-10 on `CloudSync-Test/TwoWay-1110`:
+  new/edited/deleted files and a new subfolder uploaded in ~3 s; a file
+  written over 8 s uploaded once, complete; a Drive edit plus a live edit
+  kept both copies; `deletes approve` and `cancel` while running; flush at
+  stop; offline start; guard hold in live mode.
 - **Real `MyFiles`:** first two-way sync on Fedora **done and verified**
-  2026-11-10: 116 uploaded, 31 moved to Drive's trash (mostly moves,
-  `ISSUES.md` #6; the owner confirmed the real deletes), 47 folders
-  created, 6 emptied ones removed, nothing failed, 1m02s. A re-plan shows
-  all 1,426 files in sync.
-- **Not yet:** the background service (`cloudsync run`), live upload,
-  shutdown blocking, notifications, start at login, Windows catch-up.
-  The Recycle Bin code is untested on Windows.
-- **Next:** step 3, `cloudsync run`: catch-up at start (what `sync` does
-  now, with `--yes` and held deletes left for `cloudsync deletes`), then
-  live upload of local edits.
+  2026-11-10 (1,426 files in sync). `cloudsync run` has **not** been run
+  on it yet: show the owner, then try it in a terminal.
+- **Not yet:** shutdown blocking (step 4), notifications and polished error
+  messages (step 5), start at login (step 6), then the Windows catch-up.
+  The Recycle Bin code and the Windows folder watcher are untested on
+  Windows.
+- **Next:** step 4, holding shutdown while uploads are pending (logind
+  inhibitor on Linux, `ShutdownBlockReasonCreate` on Windows) and the
+  unsynced-files list. Discuss the design with the owner first.
 
 | Phase | State |
 |---|---|
@@ -91,11 +98,12 @@ Phase 3 (background service), step 2 of 6 done: two-way sync by hand.
 | Windows-name translation (`internal/winname`, `ISSUES.md` #1, #2) | done on Linux; verify on Windows |
 | Fedora first sync of `~/My_Files` | **done and verified** 2026-10-28: nothing failed; re-plan shows 1,341 files in sync, 0 to transfer |
 | Faster uploads (`ISSUES.md` #5) | **done** 2026-11-03: test sync of 52 folders + 73 files went from 122 s to 33 s |
-| 3: continuous two-way sync daemon (background service) | **in progress**: two-way `plan`/`sync` by hand and `cloudsync deletes` done and live-tested 2026-11-10. Next: `cloudsync run` |
+| 3: continuous two-way sync daemon (background service) | **in progress**: two-way `plan`/`sync`, `cloudsync deletes` and `cloudsync run` (catch-up + live upload) done and live-tested 2026-11-10. Next: shutdown blocking |
 
 After a root's first sync, `cloudsync sync` runs a two-way sync by hand
-(`cmd/cloudsync/twoway.go`). Nothing syncs on its own until `cloudsync run`
-exists, and Windows still runs the old build.
+(`cmd/cloudsync/twoway.go`) and `cloudsync run` keeps syncing
+(`run.go`, `live.go`). Nothing starts at login yet, and Windows still runs
+the old build.
 
 ### Fedora first sync (2026-10-28)
 
@@ -176,10 +184,11 @@ Packages:
 
 | Package | Role |
 |---|---|
-| `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`, `deletes`; terminal progress bar (`progress.go`). `plan`/`sync` use `plan.FirstSync` until a root's first sync is done, then `twoway.go`: `planLater` (root-folder checks, `reconcile.Reconcile` with `Skips`, `Gate`), `syncLater`/`runLater` (delete log, held deletes, `engine.Sync`). `deletes approve`/`cancel` run a full sync with that answer, so held deletes are re-checked first |
+| `cmd/cloudsync` | CLI: `login`, `logout`, `whoami`, `init`, `plan`, `sync`, `deletes`; terminal progress bar (`progress.go`). `plan`/`sync` use `plan.FirstSync` until a root's first sync is done, then `twoway.go`: `planLater` (root-folder checks, `reconcile.Reconcile` with `Skips`, `Gate`), `syncLater`/`runLater` (delete log, held deletes, `engine.Sync`). `deletes approve`/`cancel` run a full sync with that answer, so held deletes are re-checked first. `run.go`: `cloudsync run` (catch-up per root with retries, then a loop: `internal/watch` signal → `schedule` (3 s quiet, 30 s cap) → live pass; hourly rescan; flush at exit; `fatal` vs retried errors). `live.go`: `planLive` rescans and reconciles against the state DB standing in for Drive (`treeFromBase`), so a live pass only uploads or trashes in Drive; it skips held deletes, files changed in the last 2 s and the `session`'s unsynced Drive paths, and its held deletes join the pending question (`later.live`). `openState` waits for another process's lock |
 | `internal/config` | `config.toml` load/write/validate, `ParseSize`, per-OS dirs. No built-in default root: a missing config returns `ErrNoConfig` |
 | `internal/auth` | OAuth loopback + PKCE, token in OS keyring, refreshed tokens saved back |
-| `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, `Update` in place (refuses with `ErrChanged` if Drive's copy isn't the last-synced checksum), `Trash`, `HasChildren`, downloads, `Retry` (backoff on 429/5xx/rate-limit 403), `countingTransport` for upload progress, `Tree.Filter` |
+| `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, `Update` in place (refuses with `ErrChanged` if Drive's copy isn't the last-synced checksum), `Trash`, `HasChildren`, downloads, `Retry` (backoff on 429/5xx/rate-limit 403/network; never on a refused sign-in), `Temporary`, `SignInRejected`, `Stat`, `countingTransport` for upload progress, `Tree.Filter` |
+| `internal/watch` | Signals "something changed" under a root, never what (callers rescan, so a lost or merged event can't lose an edit). Linux: fsnotify (inotify) per folder, folder list refreshed after each pass. Windows: one recursive `ReadDirectoryChangesW` on the root, so subfolders stay renamable |
 | `internal/filter` | gitignore-style `Matcher` (last match wins, `!`, anchored `/x/`, `**`, case-insensitive), `.cloudsyncignore`, size limit, `CheckName` for names no system can sync |
 | `internal/winname` | Windows stand-in names: `Encode` (pure), and `Map` (true path ↔ local name, case-insensitive taken names, `Found` for scans, `Assign` for new entries). A nil `*Map` is the identity, used on Linux |
 | `internal/localfs` | `Scan`: walks a root, skips repos, applies rules, flags issues, reports true paths through a `winname.Map`; `MD5File` |
@@ -220,7 +229,14 @@ Decided with the owner on 2026-11-05:
 - **Build for Fedora and Windows together.**
 - **Drive is checked once per boot** (when `cloudsync run` starts), and when
   the owner runs `cloudsync sync` by hand. There is no periodic Drive poll:
-  phone edits arrive at the next boot.
+  phone edits arrive at the next boot. **Reconfirmed 2026-11-10** after the
+  trade-off was raised (sleep isn't a boot, so a laptop that only sleeps
+  never re-checks): the owner rarely edits on the phone and usually shuts
+  the laptop down, so it stays as is. Don't re-ask. The trade-off is
+  documented for other users in the README ("When Drive is checked"); the
+  possible addition, if wanted later, is a change-feed check every ~10 min,
+  on resume from sleep and on network return, running the usual catch-up
+  when anything changed.
 - **Local edits upload live,** a few seconds after they settle, plus a final
   flush at shutdown.
 - **Big-delete guard:** hold all deletes of a run, and ask, when it would
@@ -254,9 +270,11 @@ Outline:
   remote. Upload, download, trash locally or in Drive, keep both on
   conflict, and an edit beats a delete. Big-delete guard and dry run. Test it
   with a table of cases.
-- **Live mode:** fsnotify with about 3 s debounce and a stable-size check;
-  a full local rescan hourly and on watcher overflow. Drive is not polled
-  (see above).
+- **Live mode (built 2026-11-10):** a watcher signal, then about 3 s of
+  quiet (30 s at most), then a full local rescan compared with the state DB;
+  files changed in the last 2 s wait for the next pass. Also an hourly
+  rescan and one on watcher overflow. Drive is not polled (see above). A
+  full rescan of the owner's folder takes ~45 ms.
 - **Shutdown:** on Linux, a logind inhibitor in "block" mode (D-Bus
   `org.freedesktop.login1.Manager.Inhibit`) held only while uploads are
   pending, which KDE shows in its logout screen, plus a flush in `ExecStop`.

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -46,7 +47,7 @@ func runSync(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	db, closeState, err := openState()
+	db, closeState, err := openState(ctx, os.Stdout)
 	if err != nil {
 		return err
 	}
@@ -163,8 +164,9 @@ func firstSyncDone(ctx context.Context, db *state.DB, root string) (bool, error)
 }
 
 // openState opens the state database and takes a lock so only one CloudSync
-// process syncs at a time.
-func openState() (*state.DB, func(), error) {
+// process syncs at a time. If another one is syncing (`cloudsync run` in the
+// middle of a pass, say), it says so on w and waits for it, until ctx ends.
+func openState(ctx context.Context, w io.Writer) (*state.DB, func(), error) {
 	dir, err := config.StateDir()
 	if err != nil {
 		return nil, nil, err
@@ -178,7 +180,13 @@ func openState() (*state.DB, func(), error) {
 		return nil, nil, fmt.Errorf("locking %s: %w", dir, err)
 	}
 	if !locked {
-		return nil, nil, fmt.Errorf("another CloudSync is already running (lock file %s)", lock.Path())
+		fmt.Fprintln(w, "Another CloudSync is syncing right now; waiting for it to finish (Ctrl-C to stop waiting)...")
+		if locked, err = lock.TryLockContext(ctx, 500*time.Millisecond); !locked {
+			if err == nil || errors.Is(err, context.Canceled) {
+				err = errors.New("stopped waiting for the other CloudSync")
+			}
+			return nil, nil, fmt.Errorf("locking %s: %w", dir, err)
+		}
 	}
 	db, err := state.Open(filepath.Join(dir, "state.db"))
 	if err != nil {
