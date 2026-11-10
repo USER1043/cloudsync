@@ -18,6 +18,7 @@ small uploads, Windows locking the running `.exe`) are recorded in
 | 5 | Uploads slower than the connection allows | fixed |
 | 6 | A moved file is re-uploaded and its old copy trashed | open (by design until rename detection) |
 | 7 | An expired or revoked sign-in was retried like a network outage | fixed |
+| 8 | A computer took another's shutdown list for its own and deleted it | fixed |
 
 ## 1. Names that Windows can't store are skipped
 
@@ -183,3 +184,22 @@ small uploads, Windows locking the running `.exe`) are recorded in
   and says to run `cloudsync login`. `gdrive.Temporary` exposes the
   remaining "retry later" cases. Tested with wrapped errors in
   `retry_test.go`.
+
+## 8. A computer took another's shutdown list for its own and deleted it
+
+- **Found:** 2026-11-10, real shutdown test with two scratch computers on
+  one Fedora machine.
+- **Symptom:** computer A shut down with a file not uploaded and saved its
+  unsynced-files list to Drive, but B gave no warning at its next start,
+  and the list was gone afterwards.
+- **Cause:** the list was named by OS (`pending-linux-<root>.json`). B is
+  Linux too, so it took A's list for its own: it skipped it when looking
+  for other computers' lists and, after a clean catch-up, removed it. The
+  owner's Fedora + Windows pair wouldn't hit this, but two computers with
+  the same OS would.
+- **Fix:** each computer gets a random ID, kept in its state DB
+  (`computer_id`), and lists are named `pending-<os>-<id>-<root>.json`. A
+  reader looks at every `pending-*.json` in the `.cloudsync` folder, skips
+  its own, and checks the root named inside the list. Re-tested live: B
+  warned, A's next start uploaded the file and removed the list, and B
+  then gave no warning.

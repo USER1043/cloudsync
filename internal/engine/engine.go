@@ -453,6 +453,11 @@ func (s *run) do(a reconcile.Action) {
 	defer s.report()
 	if err != nil {
 		s.res.Failed = append(s.res.Failed, filter.Issue{Rel: a.Rel, Reason: err.Error()})
+		if s.ctx.Err() != nil {
+			// Interrupted, not broken: the next run picks it up.
+			fmt.Fprintf(s.opt.Log, "[%d/%d] stopped  %s %s\n", s.done, s.total, verb(a), a.Rel)
+			return
+		}
 		fmt.Fprintf(s.opt.Log, "[%d/%d] FAILED %s %s: %v\n", s.done, s.total, verb(a), a.Rel, err)
 		return
 	}

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/USER1043/cloudsync/internal/filter"
 	"github.com/USER1043/cloudsync/internal/gdrive"
 	"github.com/USER1043/cloudsync/internal/reconcile"
+	"github.com/USER1043/cloudsync/internal/shutdown"
 	"github.com/USER1043/cloudsync/internal/watch"
 )
 
@@ -28,7 +30,7 @@ const (
 	quiet        = 3 * time.Second  // a live pass waits for the folder to be still this long
 	maxDelay     = 30 * time.Second // but no longer than this after the first change, if changes never stop
 	rescanEvery  = time.Hour        // a pass even without changes, in case the watcher missed one
-	flushTimeout = time.Minute      // the last pass at exit gives up after this
+	flushTimeout = 40 * time.Second // the last pass at exit gives up after this, inside Fedora's 45 s stop timeout
 	minRetry     = 30 * time.Second // after a failure, wait this long, doubling each time...
 	maxRetry     = 5 * time.Minute  // ...up to this
 )
@@ -44,7 +46,18 @@ type daemon struct {
 	d        *gdrive.Client
 	log      io.Writer
 	w        *watch.Watcher
-	sessions []*session
+	sessions []*session // complete before live passes or shutdown hooks run
+
+	guard    *shutdown.Guard    // nil if shutdowns can't be watched
+	stop     context.CancelFunc // ends the daemon, which then flushes
+	done     chan struct{}      // closed when the daemon has finished
+	stopping chan struct{}      // a shutdown has started
+	failing  atomic.Bool        // the last pass failed; Windows doesn't hold a shutdown for it
+
+	id string // computerID; set by the first catch-up
+
+	mu     sync.Mutex
+	listed map[*session]bool // sessions whose pending list was saved at this shutdown
 }
 
 func runRun(ctx context.Context, args []string) error {
@@ -72,11 +85,24 @@ func runRun(ctx context.Context, args []string) error {
 		return err
 	}
 	defer w.Close()
-	dm := &daemon{cfg: e.cfg, m: m, d: d, log: newLogWriter(os.Stdout), w: w}
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	dm := &daemon{
+		cfg: e.cfg, m: m, d: d, log: newLogWriter(os.Stdout), w: w,
+		stop: stop, done: make(chan struct{}), stopping: make(chan struct{}, 1), listed: map[*session]bool{},
+	}
+	defer close(dm.done)
 	dm.logf("CloudSync %s started (config %s).", version, e.cfg.Path())
 
 	err = dm.catchUpAll(ctx)
 	if err == nil {
+		g, gerr := shutdown.Start(shutdown.Hooks{Starting: dm.shutdownStarting, Holding: dm.holding, Ending: dm.ending})
+		if gerr != nil {
+			dm.logf("Can't watch for shutdowns (%v): changes made just before one may upload only at the next start.", gerr)
+		} else {
+			dm.guard = g
+			defer g.Close()
+		}
 		err = dm.live(ctx)
 	}
 	switch {
@@ -166,6 +192,11 @@ func (dm *daemon) catchUp(ctx context.Context, root config.Root) (*session, erro
 	} else if !done {
 		return nil, errNoFirstSync
 	}
+	if dm.id == "" {
+		if dm.id, err = computerID(ctx, db); err != nil {
+			return nil, err
+		}
+	}
 	dm.logf("%s: catching up with Drive...", root.Name)
 	names, err := loadNames(ctx, db, root.Name)
 	if err != nil {
@@ -175,6 +206,12 @@ func (dm *daemon) catchUp(ctx context.Context, root config.Root) (*session, erro
 	if err != nil {
 		return nil, err
 	}
+	// Made now, so a shutdown has only the list itself to save.
+	metaID, err := dm.d.EnsurePath(ctx, metaSegments(root))
+	if err != nil {
+		return nil, err
+	}
+	dm.warnStale(ctx, root, metaID, in.tree)
 	l, err := planLater(ctx, in, db, reconcile.Undecided)
 	if err != nil {
 		return nil, err
@@ -192,12 +229,17 @@ func (dm *daemon) catchUp(ctx context.Context, root config.Root) (*session, erro
 	if len(res.Failed) > 0 {
 		dm.logf("%s: %s could not be synced (listed above); CloudSync tries again at the next start, or run `cloudsync sync`.",
 			root.Name, count(len(res.Failed), "file", "files"))
+	} else if err := dm.d.RemoveSmall(ctx, metaID, pendingName(osLabel(), dm.id, root.Name)); err != nil {
+		// What the last shutdown left unsent is in Drive now, so its list is
+		// out of date; the other system would only warn needlessly.
+		dm.logf("%s: couldn't remove the old list of files not uploaded at the last shutdown: %v", root.Name, err)
 	}
 	base, err := db.Items(ctx, root.Name)
 	if err != nil {
 		return nil, err
 	}
 	s := newSession(in, l.run, base)
+	s.metaID = metaID
 	dm.watch(s, in)
 	dm.logf("%s: in sync; watching %s for changes.", root.Name, in.local)
 	return s, nil
@@ -214,6 +256,7 @@ func (dm *daemon) live(ctx context.Context) error {
 	var (
 		sched    schedule
 		failures int
+		shutting bool // a shutdown has started: don't wait for files to settle
 	)
 	// Right away, for changes made while the catch-up ran.
 	sched.at(time.Now())
@@ -226,6 +269,9 @@ func (dm *daemon) live(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return dm.flush()
+		case <-dm.stopping:
+			shutting = true
+			sched.at(time.Now())
 		case <-dm.w.C():
 			if failures == 0 { // otherwise the retry picks it up
 				sched.change(time.Now())
@@ -238,7 +284,15 @@ func (dm *daemon) live(ctx context.Context) error {
 			}
 		case <-timer.C:
 			sched = schedule{}
-			soon, failed, err := dm.pass(ctx, settle)
+			settleFor := settle
+			if shutting {
+				settleFor = 0
+			}
+			soon, failed, err := dm.pass(ctx, settleFor)
+			dm.failing.Store(err != nil || failed)
+			if dm.guard != nil {
+				dm.guard.Recheck()
+			}
 			switch {
 			case ctx.Err() != nil:
 				continue // flush
@@ -265,17 +319,168 @@ func (dm *daemon) live(ctx context.Context) error {
 }
 
 // flush runs one last pass when CloudSync is asked to stop, so changes made
-// just before are uploaded. A second Ctrl-C (or stop signal) skips it.
+// just before are uploaded. A second Ctrl-C (or stop signal) skips it, and
+// so does being offline: waiting would only hold up the shutdown.
 func (dm *daemon) flush() error {
 	dm.logf("Stopping: uploading the last changes first (Ctrl-C again to quit now)...")
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, flushTimeout)
 	defer cancel()
+	pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+	err := dm.d.Ping(pctx)
+	pcancel()
+	if err != nil {
+		dm.logf("Not uploading: %s. Changes not uploaded yet stay here and upload at the next start.", explain(err))
+		return nil
+	}
 	if _, failed, err := dm.pass(ctx, 0); err != nil || failed {
 		dm.logf("Not everything was uploaded; the rest syncs at the next start.")
+		return nil
+	}
+	// Everything is in Drive, so a list saved as the shutdown started is
+	// out of date.
+	dm.mu.Lock()
+	var listed []*session
+	for s := range dm.listed {
+		listed = append(listed, s)
+	}
+	dm.mu.Unlock()
+	for _, s := range listed {
+		if err := dm.d.RemoveSmall(ctx, s.metaID, pendingName(osLabel(), dm.id, s.root.Name)); err != nil {
+			dm.logf("%s: couldn't remove the list of files not uploaded: %v", s.root.Name, err)
+		}
 	}
 	return nil
+}
+
+// shutdownStarting saves, for each root, the list of changes Drive doesn't
+// have yet, so the other system can warn about them even if the uploads
+// don't finish in time, and starts uploading them without waiting for
+// files to settle.
+func (dm *daemon) shutdownStarting(ctx context.Context) {
+	dm.logf("The computer is shutting down.")
+	select {
+	case dm.stopping <- struct{}{}:
+	default:
+	}
+	for _, s := range dm.sessions {
+		p, err := dm.unsynced(ctx, s)
+		if err == nil && len(p.Files) > 0 {
+			var data []byte
+			if data, err = p.encode(); err == nil {
+				err = dm.d.WriteSmall(ctx, s.metaID, pendingName(osLabel(), dm.id, s.root.Name), data)
+			}
+		}
+		n := count(len(p.Files), "file", "files")
+		switch {
+		case err != nil:
+			dm.logf("%s: couldn't save the list of changes not uploaded yet (%s); they upload at the next start.", s.root.Name, explain(err))
+		case len(p.Files) > 0:
+			dm.mu.Lock()
+			dm.listed[s] = true
+			dm.mu.Unlock()
+			dm.logf("%s: %s not uploaded yet; saved the list in Drive, so other computers warn about what doesn't make it.", s.root.Name, n)
+		}
+	}
+}
+
+// unsynced lists the changes in s that Drive doesn't have yet. It reads
+// the state DB without the lock, so it works while a pass is uploading.
+func (dm *daemon) unsynced(ctx context.Context, s *session) (pendingList, error) {
+	db, err := peekState()
+	if err != nil || db == nil {
+		return pendingList{}, err
+	}
+	defer db.Close()
+	l, _, err := planLive(ctx, s, dm.m, db, time.Now(), 0)
+	if err != nil {
+		return pendingList{}, err
+	}
+	return pendingFrom(l, dm.id, time.Now()), nil
+}
+
+// holding is why Windows should hold a shutdown: uploads still to do. It
+// doesn't hold one when uploads are failing or Drive can't be reached,
+// since waiting can't help then.
+func (dm *daemon) holding() string {
+	if dm.failing.Load() {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	n := 0
+	for _, s := range dm.sessions {
+		p, err := dm.unsynced(ctx, s)
+		if err != nil {
+			return ""
+		}
+		n += len(p.Files)
+	}
+	if n == 0 || dm.d.Ping(ctx) != nil {
+		return ""
+	}
+	return "Uploading " + count(n, "file", "files") + " to Google Drive"
+}
+
+// ending is Windows' last word: the session ends now. It stops the daemon,
+// which flushes, and waits for that so the process isn't cut off first.
+func (dm *daemon) ending() {
+	dm.stop()
+	select {
+	case <-dm.done:
+	case <-time.After(flushTimeout + 5*time.Second):
+	}
+}
+
+// warnStale reads the lists other computers left at shutdown and warns
+// about changes Drive still doesn't have, judged by tree, the Drive listing.
+func (dm *daemon) warnStale(ctx context.Context, root config.Root, metaID string, tree *gdrive.Tree) {
+	names, err := dm.d.ListSmall(ctx, metaID)
+	if err != nil {
+		dm.logf("%s: couldn't look for other computers' lists of files not uploaded: %v", root.Name, err)
+		return
+	}
+	own := pendingName(osLabel(), dm.id, root.Name)
+	for _, name := range names {
+		if !isPendingName(name) || name == own {
+			continue
+		}
+		data, err := dm.d.ReadSmall(ctx, metaID, name)
+		if err != nil {
+			dm.logf("%s: couldn't read %s: %v", root.Name, name, err)
+			continue
+		}
+		p, err := decodePending(data)
+		if err != nil {
+			dm.logf("%s: %s is unreadable: %v", root.Name, name, err)
+			continue
+		}
+		if p.Root != root.Name || p.Computer == dm.id {
+			continue
+		}
+		stale := p.stale(tree)
+		if len(stale) == 0 {
+			continue
+		}
+		paths := make([]string, len(stale))
+		for i, f := range stale {
+			paths[i] = f.Path
+			if f.Deleted {
+				paths[i] += " (deleted there)"
+			}
+		}
+		if len(paths) > 10 {
+			paths = append(paths[:10], fmt.Sprintf("and %d more", len(stale)-10))
+		}
+		who := p.OS
+		if p.Host != "" {
+			who += " (" + p.Host + ")"
+		}
+		dm.logf("%s: WARNING: %s shut down on %s before uploading %s, so these are missing or out of date here until it "+
+			"next starts online (editing them here first leaves conflict copies to sort out): %s",
+			root.Name, who, p.At.Local().Format("2 Jan 15:04"), count(len(stale), "change", "changes"), strings.Join(paths, ", "))
+	}
 }
 
 // pass runs a live pass over every root, treating files changed in the last

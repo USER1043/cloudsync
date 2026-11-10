@@ -45,10 +45,27 @@ design for that limit, including quota checks.
   Drive duplicates, invalid UTF-8) are still skipped and reported.
 - **Git repos are skipped entirely** (any folder with `.git`); code goes
   through GitHub. Dependency and cache folders are ignored by default.
-- **Shutdown with pending uploads:** block shutdown with a message ("uploading
-  N files"). If the user chooses "shut down anyway", keep the queue for the
-  next boot of that OS **and** upload a small *unsynced-files list* so the
-  other OS warns at login which files are stale.
+- **Shutdown with pending uploads (revised 2026-11-10, Phase 3 step 4):**
+  the moment shutdown starts, upload a small *unsynced-files list* so the
+  other OS warns at its next start which files are stale; then keep
+  uploading until the system stops CloudSync. Unsent edits stay on disk and
+  upload at that OS's next start (nothing to queue: a local change is
+  whatever differs from the state DB). Details under "Phase 3 plan".
+  - **Fedora never blocks shutdown.** Tested 2026-11-10 on Plasma 6.8.2: with
+    a logind "block" inhibitor held, KDE's Shut Down silently does nothing
+    (logind answers `CanPowerOff` with "challenge"; no message, no "shut
+    down anyway"). Instead a logind **delay** inhibitor (max 5 s,
+    `InhibitDelayMaxUSec`) gives time to upload the list, then the SIGTERM
+    flush gets the user unit's stop time (Fedora: 45 s default, 1 min for
+    `user@1000.service`; Wi-Fi is still up).
+  - **Windows blocks** ("CloudSync is preventing shutdown: uploading N
+    files", `ShutdownBlockReasonCreate` + `WM_QUERYENDSESSION`), **but not
+    when offline**: waiting can't help (owner's decision).
+  - **Sleep is never blocked** (a laptop in a bag must sleep).
+  - **The list checks itself:** each entry records size and modified time
+    (uploads keep the local mtime), so the reader warns only about files
+    whose Drive copy still differs; a late-finishing upload causes no false
+    alarm. Not sent when nothing is pending or when offline.
 - **Phone:** the Google Drive iOS app. Native Google Docs/Sheets/Slides are
   skipped (there is no file behind them).
 - **Each user brings their own Google OAuth client** (Desktop app type). An
@@ -60,34 +77,40 @@ design for that limit, including quota checks.
 
 ### Where we left off (2026-11-10): give the owner this when they ask
 
-Phase 3 (background service), step 3 of 6 done: `cloudsync run`.
+Phase 3 (background service), step 3 of 6 committed (`e6c2d72`, not
+pushed); **step 4 (shutdown) built and tested with a real shutdown
+2026-11-10, waiting for the owner's go-ahead to commit.**
 
-- **Works now:** after a folder's first sync, `cloudsync plan` shows and
-  `cloudsync sync` carries out a two-way sync: edits, new files and
-  deletes in both directions (deletes to the Trash/Recycle Bin or Drive's
-  trash), keep-both conflicts. The big-delete guard holds more than 50
-  files or 10%; `cloudsync deletes` shows them, `approve` runs them and
-  `cancel` puts the files back.
-- **`cloudsync run` (new):** catches up with Drive at start (as `sync
-  --yes`; held deletes wait for `cloudsync deletes`), then uploads local
-  changes ~3 s after they settle, and flushes the last changes on Ctrl-C or
-  SIGTERM. Offline at start: explains and retries (30 s doubling to 5 min).
-  Other commands still work while it runs (it takes the lock only while
-  syncing). Live-tested 2026-11-10 on `CloudSync-Test/TwoWay-1110`:
-  new/edited/deleted files and a new subfolder uploaded in ~3 s; a file
-  written over 8 s uploaded once, complete; a Drive edit plus a live edit
-  kept both copies; `deletes approve` and `cancel` while running; flush at
-  stop; offline start; guard hold in live mode.
-- **Real `MyFiles`:** first two-way sync on Fedora **done and verified**
-  2026-11-10 (1,426 files in sync). `cloudsync run` has **not** been run
-  on it yet: show the owner, then try it in a terminal.
-- **Not yet:** shutdown blocking (step 4), notifications and polished error
-  messages (step 5), start at login (step 6), then the Windows catch-up.
-  The Recycle Bin code and the Windows folder watcher are untested on
-  Windows.
-- **Next:** step 4, holding shutdown while uploads are pending (logind
-  inhibitor on Linux, `ShutdownBlockReasonCreate` on Windows) and the
-  unsynced-files list. Discuss the design with the owner first.
+- **Works now:** two-way `cloudsync plan`/`sync`, the big-delete guard with
+  `cloudsync deletes` (`approve`/`cancel`), and `cloudsync run`: catch-up
+  with Drive at start, then local changes uploaded ~3 s after they settle,
+  a flush on Ctrl-C/SIGTERM/SIGHUP, offline retries, other commands usable
+  alongside. Live-tested 2026-11-10 on scratch Drive folders.
+- **Step 4 (built 2026-11-10, uncommitted):** `internal/shutdown` (logind
+  delay inhibitor + `PrepareForShutdown` on Linux; hidden window with
+  `ShutdownBlockReasonCreate` on Windows, holding only while uploads are
+  pending and Drive is reachable), `cmd/cloudsync/pending.go` (the
+  unsynced-files list) and its use in `run.go`: `shutdownStarting` saves the
+  list, `flush` (40 s, skipped at once if `Ping` fails) uploads and then
+  removes it, `catchUp` warns about other systems' stale lists
+  (`warnStale`) and removes this system's own; `gdrive/small.go`
+  (`ReadSmall`, `WriteSmall`, `RemoveSmall`, `Ping`). Unit tests pass;
+  checked under a systemd user service: keyring works, logind lists the
+  inhibitor as "shutdown"/"delay", stop flushes.
+- **Real shutdown test passed (2026-11-10)** with scratch computers A and B
+  in `~/.local/share/cloudsync-shutdown-test` (`cs.sh A|B ...`; Drive
+  folder `CloudSync-Test/TwoWay-1110`), A running as a transient systemd
+  user unit, a 150 MB upload in progress: "shutting down" logged, the list
+  saved within 2.4 s, the small file already up, the 40 s flush stopped
+  cleanly inside Fedora's 45 s, and A's next start uploaded the rest. The
+  test found `ISSUES.md` #8 (lists named by OS; now by computer ID), fixed
+  and re-tested: B warned, A removed its list, B then gave no warning.
+  The Windows half (window, hold reason) is untested until Windows.
+- **Real `MyFiles`:** first two-way sync on Fedora done and verified
+  2026-11-10 (1,426 files in sync); `cloudsync run` not tried on it yet.
+- **Not yet:** notifications and polished errors (step 5), start at login
+  (step 6: systemd user unit with `TimeoutStopSec=45`, Windows logon task
+  built with `-H windowsgui`), then the Windows catch-up.
 
 | Phase | State |
 |---|---|
@@ -98,7 +121,7 @@ Phase 3 (background service), step 3 of 6 done: `cloudsync run`.
 | Windows-name translation (`internal/winname`, `ISSUES.md` #1, #2) | done on Linux; verify on Windows |
 | Fedora first sync of `~/My_Files` | **done and verified** 2026-10-28: nothing failed; re-plan shows 1,341 files in sync, 0 to transfer |
 | Faster uploads (`ISSUES.md` #5) | **done** 2026-11-03: test sync of 52 folders + 73 files went from 122 s to 33 s |
-| 3: continuous two-way sync daemon (background service) | **in progress**: two-way `plan`/`sync`, `cloudsync deletes` and `cloudsync run` (catch-up + live upload) done and live-tested 2026-11-10. Next: shutdown blocking |
+| 3: continuous two-way sync daemon (background service) | **in progress**: two-way `plan`/`sync`, `cloudsync deletes`, `cloudsync run` (catch-up + live upload) and shutdown handling done and live-tested 2026-11-10. Next: notifications and errors (step 5), start at login (step 6) |
 
 After a root's first sync, `cloudsync sync` runs a two-way sync by hand
 (`cmd/cloudsync/twoway.go`) and `cloudsync run` keeps syncing
@@ -188,6 +211,7 @@ Packages:
 | `internal/config` | `config.toml` load/write/validate, `ParseSize`, per-OS dirs. No built-in default root: a missing config returns `ErrNoConfig` |
 | `internal/auth` | OAuth loopback + PKCE, token in OS keyring, refreshed tokens saved back |
 | `internal/gdrive` | Drive v3: find/create folders (`EnsureFolder` looks first; `CreateFolder` only on retry), list trees, chunked resumable uploads, `Update` in place (refuses with `ErrChanged` if Drive's copy isn't the last-synced checksum), `Trash`, `HasChildren`, downloads, `Retry` (backoff on 429/5xx/rate-limit 403/network; never on a refused sign-in), `Temporary`, `SignInRejected`, `Stat`, `countingTransport` for upload progress, `Tree.Filter` |
+| `internal/shutdown` | Hears a shutdown as early as the system allows: `Hooks.Starting` (save the unsynced-files list), `Holding` (Windows only: the reason to hold, or ""), `Ending` (Windows `WM_ENDSESSION`). Linux: logind **delay** inhibitor (never block: KDE gives no message for a blocked shutdown) and `PrepareForShutdown`, matched only from logind. Windows: hidden top-level window on a locked thread. Sleep is never touched |
 | `internal/watch` | Signals "something changed" under a root, never what (callers rescan, so a lost or merged event can't lose an edit). Linux: fsnotify (inotify) per folder, folder list refreshed after each pass. Windows: one recursive `ReadDirectoryChangesW` on the root, so subfolders stay renamable |
 | `internal/filter` | gitignore-style `Matcher` (last match wins, `!`, anchored `/x/`, `**`, case-insensitive), `.cloudsyncignore`, size limit, `CheckName` for names no system can sync |
 | `internal/winname` | Windows stand-in names: `Encode` (pure), and `Map` (true path ↔ local name, case-insensitive taken names, `Found` for scans, `Assign` for new entries). A nil `*Map` is the identity, used on Linux |
@@ -195,7 +219,7 @@ Packages:
 | `internal/plan` | `FirstSync`: pure union-merge planner; exact path matching |
 | `internal/engine` | Carries out a plan (`FirstSync` from `plan`, `Sync` from `reconcile`; both run the same reconcile actions): folders a depth at a time (each depth in parallel; `CreateFolder` skips the lookup inside folders made in the same run), then 8 parallel transfers, largest first, MD5-verified, atomic downloads (`.name.cloudsync-partial` then rename), keep-both conflicts, progress callbacks. `Sync` checks every change against what the plan saw: a local file saved after the scan is never overwritten or trashed, and an update that finds a newer Drive edit becomes a conflict. Trashes go to `Options.Trash` (default `trash.Move`) or Drive's trash; folders are removed only when empty |
 | `internal/trash` | `Move` to the OS trash: freedesktop.org Trash on Linux (home trash, or the file system's `.Trash-$uid` across devices/subvolumes), Recycle Bin via `SHFileOperationW` on Windows (asks before deleting outright what the Recycle Bin can't take) |
-| `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`); `delete_log` (each run's deletes, root size, whether the guard held them and the owner's answer: auto, pending, approved, cancelled, superseded) and `held_deletes` (the pending event's deletes; one pending event per root) |
+| `internal/state` | SQLite (`modernc.org/sqlite`): `items` (per root/rel: drive_id, size, md5, local_mtime, local_name for Windows stand-ins; schema v2, migrates v1) and `meta` (Drive changes token, `first_sync_done:<root>`, `root_folder_id:<root>`, `computer_id`); `delete_log` (each run's deletes, root size, whether the guard held them and the owner's answer: auto, pending, approved, cancelled, superseded) and `held_deletes` (the pending event's deletes; one pending event per root) |
 | `internal/reconcile` | Phase 3 planner: `Reconcile`, a pure three-way comparison of scan, Drive tree and base (state DB) into actions (upload, download, trash here or in Drive, conflict, folders, record, forget, wait); `Skip` keeps paths missing for other reasons (too large, unreadable, repos) from being trashed. `Skips` builds it from the scan and Drive tree (repos, too large, unreadable, Drive duplicates, Google Docs, Drive-side filtered). `Guard` interface with `DefaultGuard` (more than 50 files or 10%); `Gate` applies it with the owner's answer to earlier held deletes (approve runs them, cancel `Undo`es them) |
 
 **The root name is the state DB key; never rename the `MyFiles` root.** The
@@ -275,14 +299,24 @@ Outline:
   files changed in the last 2 s wait for the next pass. Also an hourly
   rescan and one on watcher overflow. Drive is not polled (see above). A
   full rescan of the owner's folder takes ~45 ms.
-- **Shutdown:** on Linux, a logind inhibitor in "block" mode (D-Bus
-  `org.freedesktop.login1.Manager.Inhibit`) held only while uploads are
-  pending, which KDE shows in its logout screen, plus a flush in `ExecStop`.
-  On Windows, `ShutdownBlockReasonCreate` on a hidden window, answering
-  `WM_QUERYENDSESSION`.
-- **Unsynced-files list:** `CloudSync/.cloudsync/pending-<os>.json`, outside
-  any root folder. The other OS reads it at start, sends a notification, and
-  it is cleared once those files are uploaded.
+- **Shutdown (step 4, design agreed 2026-11-10; see "Decisions already
+  made"):** on Linux a logind **delay** inhibitor (D-Bus
+  `org.freedesktop.login1.Manager.Inhibit`, mode "delay") and the
+  `PrepareForShutdown` signal: upload the unsynced-files list within the
+  5 s, release, then the SIGTERM flush (about 40 s; skipped at once when
+  offline). On Windows, a hidden top-level window answering
+  `WM_QUERYENDSESSION` with `ShutdownBlockReasonCreate` while uploads are
+  pending and Drive is reachable, and finishing in `WM_ENDSESSION`.
+- **Unsynced-files list:** `<root's parent>/.cloudsync/pending-<os>-<computer id>-<root>.json`
+  in Drive (`CloudSync/.cloudsync/pending-linux-3f9a1c2b-MyFiles.json`),
+  outside the root folder; the computer ID is random, kept in the state DB
+  (`computer_id`), so two computers with the same OS don't mix up their
+  lists (`ISSUES.md` #8). Entries: path plus size and modified time, or
+  "deleted"; the list also names its OS, host and root. Other computers
+  read every `pending-*.json` there at their catch-up and warn about
+  entries Drive still doesn't match (a log line now, a notification in
+  step 5). The writer deletes it after its next clean catch-up or a
+  complete flush.
 - **Also:** desktop notifications (freedesktop D-Bus / Windows toast), a quota
   check that pauses before Drive is full, log file with rotation, rename
   detection (Drive file ID; local inode or file ID plus hash) as a follow-up.

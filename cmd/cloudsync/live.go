@@ -23,6 +23,7 @@ type session struct {
 	root   config.Root
 	local  string
 	rootID string
+	metaID string // Drive folder for CloudSync's own files about this root (metaSegments)
 
 	// unsynced holds the Drive paths the catch-up saw but did not sync:
 	// Google Docs, duplicate or unusable names, failed downloads, file and

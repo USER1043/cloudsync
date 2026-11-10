@@ -48,7 +48,7 @@ func main() {
 		fmt.Fprint(os.Stderr, usageText)
 		os.Exit(2)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	err := run(ctx, os.Args[1], os.Args[2:])
 	stop()
 	if err != nil {

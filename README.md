@@ -138,6 +138,24 @@ boot or login), or when you run `cloudsync sync` by hand.
   from sleep and when the network returns) would be a small change; it isn't
   built because its author doesn't need it.
 
+### At shutdown
+
+- **Fedora (and other Linux):** CloudSync never blocks a shutdown; KDE
+  would give no message, its Shut Down button would just seem broken. The
+  moment shutdown starts, CloudSync saves a small list in Drive of the
+  changes it hasn't uploaded yet, then keeps uploading for up to about 40
+  seconds (systemd's stop time), less if you're offline. Press Esc on the
+  boot logo to see "A stop job is running for CloudSync".
+- **Windows:** while uploads are pending and Drive can be reached, Windows
+  shows "CloudSync is preventing shutdown: Uploading N files to Google
+  Drive", with *Shut down anyway*. Offline, it doesn't hold the shutdown.
+- **Sleep is never blocked or delayed.**
+- **Nothing is lost:** whatever didn't make it uploads at that computer's
+  next start. Meanwhile, the other computers read the list at their next
+  start and warn which files are missing or out of date there. The list
+  sits in a `.cloudsync` folder next to the synced folder in Drive and is
+  removed once everything is uploaded.
+
 ### How the first sync works
 
 - Files on only one side are copied to the other. Identical files are left
