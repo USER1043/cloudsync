@@ -34,8 +34,7 @@ Replace this section when it changes; don't add to it.
   guard, `cloudsync run`, shutdown handling, notifications, `status`, and
   `start`/`stop`/`update`.
 - **Fedora:** in sync and running in the background from login.
-- **Windows:** caught up with Drive; old-layout copies are held by the
-  big-delete guard, waiting for the owner's decision. Not yet running in
+- **Windows:** in sync with Drive, in Fedora's layout. Not yet running in
   the background.
 - What comes next is listed in `ISSUES.md` under "Next steps".
 

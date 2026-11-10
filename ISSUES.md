@@ -13,20 +13,17 @@ small uploads, Windows locking the running `.exe`) are recorded in
 
 In this order. Discuss the design with the owner before coding.
 
-1. **Held deletes on Windows.** After the Windows catch-up, the old-layout
-   copies of moved files are held by the big-delete guard. The owner
-   reviews them with `cloudsync deletes` and approves or cancels. One held
-   file has no same-named copy in Drive; check it first.
-2. **Turn on `cloudsync start` on Windows** for the real root, from a
+1. **Turn on `cloudsync start` on Windows** for the real root, from a
    normal terminal (see #9).
-3. **Check by eye on Windows,** since these can't be tested from a script:
+2. **Check by eye on Windows,** since these can't be tested from a script:
    - the tray icon and its notifications;
    - the shutdown screen ("CloudSync is preventing shutdown") with an
      upload in progress, and "shut down anyway";
    - that CloudSync starts after signing out and in again.
-4. **Still untested on Windows:** `update` going back to the previous
+3. **Still untested on Windows:** `update` going back to the previous
    version when the new build doesn't start; behaviour when offline; the
    Recycle Bin refusing a file.
+4. **Kept folders listed in every plan** (#12).
 5. **Rename detection** (#6): move instead of upload + trash.
 6. **`client_secret.json` permissions** (#4).
 7. **Adaptive big-delete guard:** tune the threshold from the delete log
@@ -49,6 +46,7 @@ In this order. Discuss the design with the owner before coding.
 | 9 | On Windows, commands run by the Claude desktop app use a different state folder | worked around |
 | 10 | The Windows watcher could miss a change made right after it started | fixed |
 | 11 | Two tests fail on Windows because they create names Windows can't store | fixed |
+| 12 | A folder kept because it holds unsynced files is listed for removal in every plan | open |
 
 ## 1. Names that Windows can't store are skipped
 
@@ -281,3 +279,21 @@ In this order. Discuss the design with the owner before coding.
   to check what Linux does with them.
 - **Fix:** both skip on Windows. The Windows behaviour is covered by
   `TestWindowsStandIns` and `TestScanTranslatesStandIns`.
+
+## 12. A folder kept because it holds unsynced files is listed for removal in every plan
+
+- **Found:** 2026-11-10, after approving the Windows catch-up's held
+  deletes.
+- **Symptom:** a folder that was deleted on the other side but still holds
+  files CloudSync doesn't sync here (a git repo, ignored files) is rightly
+  kept (`kept  Old/ (deleted on the other side, but still holds files
+  CloudSync doesn't sync here)`). But every later `plan` and `sync`
+  lists it again under "Trash here", and keeps it again.
+- **Cause:** `engine.removeFolders` leaves the folder's record in the
+  state DB when it keeps the folder, so the reconciler sees "in the base,
+  gone from Drive, still here" each time and plans the removal again.
+- **Impact:** nothing is lost, but the plan is misleading, and the folders
+  count as changes on every run.
+- **Possible fix:** forget the folder's record when it is kept (it is then
+  a local-only folder with nothing to sync), or have `reconcile.Skips`
+  cover folders whose only contents are unsynced. Decide with the owner.
