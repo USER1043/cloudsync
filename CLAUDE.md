@@ -84,9 +84,9 @@ switched on for real on Fedora the same day** (the owner approved after
 `plan` showed 1 file to upload): `~/.local/bin/cloudsync`,
 `cloudsync.service` enabled and active; its catch-up took 2 min (mostly
 the Drive listing), uploaded that file, and it now watches `~/My_Files`.
-Fedora syncs automatically from here on. The installed build is
-`3d3a173-modified` (built before step 6 was committed); after committing,
-rebuild and run `bin/cloudsync update` to get a clean version.
+Fedora syncs automatically from here on. Updated to `3736c6e` with `bin/cloudsync update` right after the step 6
+commit (the first real use of `update`: stopped with its flush, swapped,
+restarted, caught up: all 1,426 files in sync).
 
 - **Step 6 (decided with the owner 2026-11-10):** commands `start` (was
   "install"; installs the program once, registers it to start at login,
@@ -136,8 +136,9 @@ rebuild and run `bin/cloudsync update` to get a clean version.
   checked under a systemd user service: keyring works, logind lists the
   inhibitor as "shutdown"/"delay", stop flushes.
 - **Real shutdown test passed (2026-11-10)** with scratch computers A and B
-  in `~/.local/share/cloudsync-shutdown-test` (`cs.sh A|B ...`; Drive
-  folder `CloudSync-Test/TwoWay-1110`), A running as a transient systemd
+  in `~/.local/share/cloudsync-shutdown-test` (deleted afterwards at the
+  owner's request; recreate scratch configs as needed; Drive folder
+  `CloudSync-Test/TwoWay-1110`, which still exists), A running as a transient systemd
   user unit, a 150 MB upload in progress: "shutting down" logged, the list
   saved within 2.4 s, the small file already up, the 40 s flush stopped
   cleanly inside Fedora's 45 s, and A's next start uploaded the rest. The
