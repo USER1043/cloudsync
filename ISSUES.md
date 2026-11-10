@@ -7,18 +7,48 @@ examples, never real file names or paths from the synced folder.
 
 Earlier gotchas (Drive's millisecond `modifiedTime`, `go-api` buffering
 small uploads, Windows locking the running `.exe`) are recorded in
-`CLAUDE.md` under "Gotchas found so far".
+`CLAUDE.md` under "Gotchas".
+
+## Next steps
+
+In this order. Discuss the design with the owner before coding.
+
+1. **Held deletes on Windows.** After the Windows catch-up, the old-layout
+   copies of moved files are held by the big-delete guard. The owner
+   reviews them with `cloudsync deletes` and approves or cancels. One held
+   file has no same-named copy in Drive; check it first.
+2. **Turn on `cloudsync start` on Windows** for the real root, from a
+   normal terminal (see #9).
+3. **Check by eye on Windows,** since these can't be tested from a script:
+   - the tray icon and its notifications;
+   - the shutdown screen ("CloudSync is preventing shutdown") with an
+     upload in progress, and "shut down anyway";
+   - that CloudSync starts after signing out and in again.
+4. **Still untested on Windows:** `update` going back to the previous
+   version when the new build doesn't start; behaviour when offline; the
+   Recycle Bin refusing a file.
+5. **Rename detection** (#6): move instead of upload + trash.
+6. **`client_secret.json` permissions** (#4).
+7. **Adaptive big-delete guard:** tune the threshold from the delete log
+   once there is data. It must never loosen the guard silently.
+8. **Optional, only if the owner asks:** a Drive change-feed check every
+   ~10 min, on resume from sleep and on network return.
+
+## Issues
 
 | # | Issue | Status |
 |---|---|---|
-| 1 | Names that Windows can't store are skipped | fixed; Windows side to verify |
-| 2 | Names that differ only in case are skipped | fixed; Windows side to verify |
+| 1 | Names that Windows can't store are skipped | fixed; verified on Windows |
+| 2 | Names that differ only in case are skipped | fixed; verified on Windows |
 | 3 | Fedora's Go is older than `go.mod` requires | fixed |
 | 4 | `client_secret.json` can be world-readable after copying | open |
 | 5 | Uploads slower than the connection allows | fixed |
 | 6 | A moved file is re-uploaded and its old copy trashed | open (by design until rename detection) |
 | 7 | An expired or revoked sign-in was retried like a network outage | fixed |
 | 8 | A computer took another's shutdown list for its own and deleted it | fixed |
+| 9 | On Windows, commands run by the Claude desktop app use a different state folder | worked around |
+| 10 | The Windows watcher could miss a change made right after it started | fixed |
+| 11 | Two tests fail on Windows because they create names Windows can't store | fixed |
 
 ## 1. Names that Windows can't store are skipped
 
@@ -70,9 +100,10 @@ small uploads, Windows locking the running `.exe`) are recorded in
   `CloudSync-Test/NamesFedora`: Drive kept `Trail `, `a:b.txt`,
   `what?.txt`, `etc.`, `con.txt`, and `Docs` and `docs` as two folders,
   exactly; a re-plan matched all 8 files as in sync.
-- **To verify on Windows:** rebuild there (the old binary refuses the v2
-  state DB), then check the stand-ins appear as listed by `plan`. Windows
-  only downloads again once Phase 3 exists.
+- **Verified on Windows (2026-11-10):** live against a scratch Drive
+  folder, `a:b.txt`, `con.txt` and `A.TXT` (next to `a.txt`) arrived as
+  `a：b.txt`, `con＿.txt` and `A (case 2).TXT`; `plan` listed the stand-ins
+  first.
 - **Known edge:** if Drive has both `a:b` and a real `a：b` in one folder,
   whichever sorts first gets `a：b` on Windows and the other gets
   `(case 2)`, although it isn't a case clash.
@@ -203,3 +234,50 @@ small uploads, Windows locking the running `.exe`) are recorded in
   its own, and checks the root named inside the list. Re-tested live: B
   warned, A's next start uploaded the file and removed the list, and B
   then gave no warning.
+
+## 9. On Windows, commands run by the Claude desktop app use a different state folder
+
+- **Found:** 2026-11-10, Windows catch-up.
+- **Symptom:** `cloudsync plan` run by Claude showed a normal later sync,
+  but `cloudsync sync` in a terminal offered a *first* sync that would have
+  uploaded the old-layout files again. It was cancelled at the prompt.
+- **Cause:** the Claude desktop app is a packaged Windows app. For commands
+  Claude runs through its own tools, Windows redirects writes under
+  `%LocalAppData%` to
+  `%LocalAppData%\Packages\<Claude package>\LocalCache\Local\`. The first
+  Windows sync had been run that way, so the state DB existed only in the
+  redirected folder. A terminal, and anything started at login, sees the
+  real `%LocalAppData%\cloudsync`, which was empty. `%AppData%` (the
+  config) and the keyring are not affected.
+- **Worked around:** copied `state.db` into the real folder from a
+  terminal; `plan` there then matched, and the catch-up ran from the
+  terminal.
+- **Rule:** on Windows, run every `cloudsync` command that touches state
+  from a real terminal, never through the Claude app's own tools.
+- **Possible fix:** none needed in CloudSync; a warning when the state
+  folder is redirected would be possible but is not planned.
+
+## 10. The Windows watcher could miss a change made right after it started
+
+- **Found:** 2026-11-10, `TestWatch` failing once in a full test run on
+  Windows.
+- **Cause:** `Watch` opened the folder and returned, and a goroutine made
+  the first `ReadDirectoryChangesW` call later. Windows records changes
+  only from that first call, so a change in between was lost until the
+  hourly rescan.
+- **Fix:** the handle is opened for overlapped I/O and the first read is
+  issued before `Watch` returns; the goroutine collects results and
+  listens again. Each reader closes its own handle after its cancelled
+  read returns.
+- **Verified:** `TestWatch` passed 30 runs in a row; live under
+  `cloudsync run`, a new file, an edit, a folder rename and a delete were
+  each picked up within seconds.
+
+## 11. Two tests fail on Windows because they create names Windows can't store
+
+- **Found:** 2026-11-10, first `go test ./...` on Windows since #1.
+- **Cause:** `TestScanKeepsWindowsOnlyNames` and
+  `TestUploadsNamesWindowsCannotStore` write files such as `Paper:1.pdf`
+  to check what Linux does with them.
+- **Fix:** both skip on Windows. The Windows behaviour is covered by
+  `TestWindowsStandIns` and `TestScanTranslatesStandIns`.
