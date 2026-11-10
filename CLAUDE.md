@@ -70,10 +70,11 @@ Phase 3 (background service), step 2 of 6 done: two-way sync by hand.
   `cancel` puts the files back. Live-tested 2026-11-10 with two scratch
   "computers" on `CloudSync-Test/TwoWay-1110`: in-place update kept the
   Drive ID, trash both ways, guard hold, cancel, approve, conflict.
-- **Real `MyFiles`:** dry run on 2026-11-10 showed 115 uploads, 37 Drive
-  deletes (mostly moves, `ISSUES.md` #6; 8 files really gone locally) and
-  47 new folders, under the guard's threshold. Not synced yet; waiting for
-  the owner's go-ahead.
+- **Real `MyFiles`:** first two-way sync on Fedora **done and verified**
+  2026-11-10: 116 uploaded, 31 moved to Drive's trash (mostly moves,
+  `ISSUES.md` #6; the owner confirmed the real deletes), 47 folders
+  created, 6 emptied ones removed, nothing failed, 1m02s. A re-plan shows
+  all 1,426 files in sync.
 - **Not yet:** the background service (`cloudsync run`), live upload,
   shutdown blocking, notifications, start at login, Windows catch-up.
   The Recycle Bin code is untested on Windows.
