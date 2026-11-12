@@ -28,3 +28,7 @@ func newService(placement) (service, error) {
 }
 
 func watchStopRequests(context.Context, placement, func()) {}
+
+const trayOwnsNotices = false
+
+func watchControl(context.Context, placement, func(ctlOp)) {}

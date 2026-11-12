@@ -56,6 +56,7 @@ type daemon struct {
 	stop     context.CancelFunc // ends the daemon, which then flushes
 	done     chan struct{}      // closed when the daemon has finished
 	stopping chan struct{}      // a shutdown has started
+	ctl      chan ctlOp         // requests from the tray (Windows): sync now, pause, resume
 	failing  atomic.Bool        // the last pass failed; Windows doesn't hold a shutdown for it
 
 	id string // computerID; set by the first catch-up
@@ -133,7 +134,7 @@ func runRun(ctx context.Context, args []string) error {
 	defer stop()
 	dm := &daemon{
 		cfg: e.cfg, m: m, d: d, log: newLogWriter(out), w: w,
-		stop: stop, done: make(chan struct{}), stopping: make(chan struct{}, 1), listed: map[*session]bool{},
+		stop: stop, done: make(chan struct{}), stopping: make(chan struct{}, 1), ctl: make(chan ctlOp, 8), listed: map[*session]bool{},
 		st: newStatusKeeper(dir),
 	}
 	defer close(dm.done)
@@ -141,11 +142,17 @@ func runRun(ctx context.Context, args []string) error {
 	if p, err := place(); err == nil {
 		// `cloudsync stop` and `update` on Windows; Linux uses SIGTERM.
 		watchStopRequests(ctx, p, stop)
+		// The tray's Sync now, Pause and Resume (Windows).
+		watchControl(ctx, p, dm.control)
 	}
-	if dm.notes, err = notify.New(); err != nil {
-		dm.logf("Desktop notifications aren't available (%v); warnings go to this log and `cloudsync status` only.", err)
-	} else {
-		defer dm.notes.Close()
+	// On Windows the tray process shows the notifications, from the
+	// warnings kept in the status file.
+	if !trayOwnsNotices {
+		if dm.notes, err = notify.New(); err != nil {
+			dm.logf("Desktop notifications aren't available (%v); warnings go to this log and `cloudsync status` only.", err)
+		} else {
+			defer dm.notes.Close()
+		}
 	}
 	dm.st.set("starting", "")
 
@@ -428,6 +435,7 @@ func (dm *daemon) live(ctx context.Context) error {
 		sched    schedule
 		failures int
 		shutting bool // a shutdown has started: don't wait for files to settle
+		paused   bool // the owner paused syncing from the tray
 	)
 	// Right away, for changes made while the catch-up ran.
 	sched.at(time.Now())
@@ -441,16 +449,38 @@ func (dm *daemon) live(ctx context.Context) error {
 		case <-ctx.Done():
 			return dm.flush()
 		case <-dm.stopping:
-			shutting = true
+			// A shutdown overrides a pause: nothing may be left behind.
+			shutting, paused = true, false
 			sched.at(time.Now())
+		case op := <-dm.ctl:
+			switch op {
+			case ctlSyncNow:
+				// Also while paused: one pass, then it stays paused.
+				dm.logf("Syncing now, as asked.")
+				sched.at(time.Now())
+			case ctlPause:
+				if !paused {
+					paused = true
+					sched = schedule{}
+					dm.logf("Paused, as asked: changes are not uploaded until you resume.")
+					dm.st.set(statePaused, "")
+				}
+			case ctlResume:
+				if paused {
+					paused = false
+					dm.logf("Resumed: catching up with changes made while paused.")
+					// A full rescan, so nothing made during the pause is missed.
+					sched.at(time.Now())
+				}
+			}
 		case <-dm.w.C():
-			if failures == 0 { // otherwise the retry picks it up
+			if failures == 0 && !paused { // otherwise the retry picks it up
 				sched.change(time.Now())
 			}
 		case err := <-dm.w.Errors():
 			dm.logf("Watching for changes: %v. Changes there are picked up by the next rescan.", err)
 		case <-hourly.C:
-			if failures == 0 {
+			if failures == 0 && !paused {
 				sched.at(time.Now())
 			}
 		case <-timer.C:
@@ -479,14 +509,20 @@ func (dm *daemon) live(ctx context.Context) error {
 					dm.logf("Trying the failed files again in %s.", delay)
 					dm.st.set("retrying files that failed", "")
 				}
-				sched.at(time.Now().Add(delay))
+				if !paused {
+					sched.at(time.Now().Add(delay))
+				}
 			default:
 				failures = 0
 				dm.recovered()
-				if soon {
+				if soon && !paused {
 					// A file was still being written; look again once it settles.
 					sched.at(time.Now().Add(settle + 500*time.Millisecond))
 				}
+			}
+			if paused {
+				// A "sync now" while paused: the pass is done, the pause isn't.
+				dm.st.set(statePaused, "")
 			}
 		}
 	}

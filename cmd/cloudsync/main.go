@@ -41,6 +41,10 @@ Commands:
             at the next start or sync. Ctrl-C uploads the last changes and
             stops. Needs a first sync with sync. Shows desktop notifications
             for what needs you (held deletes, conflicts, sign-in, Drive full).
+  tray      Windows only: the CloudSync icon in the taskbar's hidden icons.
+            Its menu shows the status and can sync now, pause, stop and start
+            the background sync, open the folder or log, and exit. It starts
+            at login and shows the notifications there. Use start to run it.
   status    Show whether run is going, when Drive was last checked, what is
             waiting to upload, held deletes and recent warnings
   start     Keep CloudSync running in the background from now on: installs
@@ -88,6 +92,8 @@ func run(ctx context.Context, cmd string, args []string) error {
 		return runDeletes(ctx, args)
 	case "run":
 		return runRun(ctx, args)
+	case "tray":
+		return runTray(ctx, args)
 	case "status":
 		return runStatusCmd(ctx, args)
 	case "start":

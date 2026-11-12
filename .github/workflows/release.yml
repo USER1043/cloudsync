@@ -1,0 +1,93 @@
+name: Release
+
+# Push a tag like v0.1.0 to build and publish:
+#   cloudsync-setup.exe              Windows installer
+#   cloudsync-linux-amd64.tar.gz     Linux program + install.sh
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the program's version comes from git
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check
+        shell: bash
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: Build the programs
+        shell: bash
+        run: |
+          mkdir -p dist
+          go build -o dist/cloudsync.exe ./cmd/cloudsync
+          # The copy that runs at login has no console window.
+          go build -ldflags "-H=windowsgui" -o dist/cloudsync-background.exe ./cmd/cloudsync
+      - name: Build the installer
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DVersion=$($env:TAG.TrimStart('v'))" installer\cloudsync.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/cloudsync-setup.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test ./...
+      - name: Build the archive
+        run: |
+          name=cloudsync-linux-amd64
+          mkdir -p "dist/$name"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "dist/$name/cloudsync" ./cmd/cloudsync
+          cp installer/install.sh "dist/$name/install.sh"
+          chmod 755 "dist/$name/cloudsync" "dist/$name/install.sh"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/cloudsync-linux-amd64.tar.gz
+
+  release:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" assets/* --repo "$GITHUB_REPOSITORY" \
+            --title "CloudSync $TAG" --generate-notes

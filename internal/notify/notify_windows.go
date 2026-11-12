@@ -19,7 +19,6 @@ var (
 	procDispatchMessageW      = user32.NewProc("DispatchMessageW")
 	procPostMessageW          = user32.NewProc("PostMessageW")
 	procPostQuitMessage       = user32.NewProc("PostQuitMessage")
-	procLoadIconW             = user32.NewProc("LoadIconW")
 	procRegisterWindowMessage = user32.NewProc("RegisterWindowMessageW")
 	procShellNotifyIconW      = shell32.NewProc("Shell_NotifyIconW")
 )
@@ -27,7 +26,12 @@ var (
 const (
 	wmDestroy = 0x0002
 	wmClose   = 0x0010
-	wmTray    = 0x8000 + 2 // WM_APP + 2: messages from the icon (unused)
+	wmTray    = 0x8000 + 2 // WM_APP + 2: messages from the icon
+
+	// What the icon reports in the low word of lParam (notify version 4).
+	wmContextMenu = 0x007B // right click
+	ninSelect     = 0x0400 // left click
+	ninKeySelect  = 0x0401 // Enter or Space on the focused icon
 
 	nimAdd        = 0
 	nimModify     = 1
@@ -43,7 +47,6 @@ const (
 	niifWarning = 0x2
 
 	notifyIconVersion4 = 4
-	idiApplication     = 32512
 )
 
 type notifyIconData struct {
@@ -98,12 +101,17 @@ type tray struct {
 	taskbarCreated uint32
 	closed         sync.Once
 
-	mu   sync.Mutex
-	icon uintptr
+	mu    sync.Mutex
+	state State
+	tip   string
+	icons map[State]uintptr
+
+	cmu      sync.Mutex // guards controls
+	controls Controls
 }
 
 func newBackend() (backend, error) {
-	t := &tray{}
+	t := &tray{state: StateBusy, tip: "CloudSync", icons: map[State]uintptr{}}
 	ready := make(chan error, 1)
 	go t.run(ready)
 	if err := <-ready; err != nil {
@@ -137,8 +145,6 @@ func (t *tray) run(ready chan<- error) {
 	tc, _ := windows.UTF16PtrFromString("TaskbarCreated")
 	r, _, _ := procRegisterWindowMessage.Call(uintptr(unsafe.Pointer(tc)))
 	t.taskbarCreated = uint32(r)
-	// The standard application icon until CloudSync has its own.
-	t.icon, _, _ = procLoadIconW.Call(0, idiApplication)
 	if err := t.add(); err != nil {
 		ready <- err
 		return
@@ -159,6 +165,12 @@ func (t *tray) proc(hwnd uintptr, message uint32, wParam, lParam uintptr) uintpt
 	case message == t.taskbarCreated && t.taskbarCreated != 0:
 		t.add()
 		return 0
+	case message == wmTray:
+		switch uint32(lParam) & 0xFFFF {
+		case wmContextMenu, ninSelect, ninKeySelect:
+			t.showMenu()
+		}
+		return 0
 	case message == wmDestroy:
 		procPostQuitMessage.Call(0)
 		return 0
@@ -173,6 +185,27 @@ func (t *tray) data() notifyIconData {
 	return d
 }
 
+// setState changes the icon's colour and tooltip.
+func (t *tray) setState(st State, text string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if st == t.state && text == t.tip {
+		return
+	}
+	t.state, t.tip = st, text
+	d := t.data()
+	d.flags = nifIcon | nifTip
+	d.icon = t.iconFor(st)
+	copyUTF16(d.tip[:], text)
+	procShellNotifyIconW.Call(nimModify, uintptr(unsafe.Pointer(&d)))
+}
+
+func (t *tray) setControls(c Controls) {
+	t.cmu.Lock()
+	t.controls = c
+	t.cmu.Unlock()
+}
+
 // add puts the icon in the notification area.
 func (t *tray) add() error {
 	t.mu.Lock()
@@ -180,8 +213,8 @@ func (t *tray) add() error {
 	d := t.data()
 	d.flags = nifMessage | nifIcon | nifTip
 	d.callbackMessage = wmTray
-	d.icon = t.icon
-	copyUTF16(d.tip[:], "CloudSync")
+	d.icon = t.iconFor(t.state)
+	copyUTF16(d.tip[:], t.tip)
 	if r, _, err := procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&d))); r == 0 {
 		return fmt.Errorf("adding the CloudSync icon to the taskbar: %w", err)
 	}

@@ -50,6 +50,10 @@ type warning struct {
 	Key   string    `json:"key"`
 	Title string    `json:"title"`
 	Body  string    `json:"body"`
+
+	// Critical is the notification's flag, kept so the tray (a separate
+	// process on Windows) can show it the same way.
+	Critical bool `json:"critical,omitempty"`
 }
 
 // statusKeeper writes runStatus to disk whenever it changes.
@@ -84,7 +88,7 @@ func (k *statusKeeper) warn(m notify.Message) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.st.Warnings = slices.DeleteFunc(k.st.Warnings, func(w warning) bool { return w.Key == m.Key })
-	k.st.Warnings = slices.Insert(k.st.Warnings, 0, warning{At: time.Now(), Key: m.Key, Title: m.Title, Body: m.Body})
+	k.st.Warnings = slices.Insert(k.st.Warnings, 0, warning{At: time.Now(), Key: m.Key, Title: m.Title, Body: m.Body, Critical: m.Critical})
 	if len(k.st.Warnings) > maxWarnings {
 		k.st.Warnings = k.st.Warnings[:maxWarnings]
 	}
@@ -168,6 +172,13 @@ func runStatusCmd(ctx context.Context, args []string) error {
 	}
 	running := runIsRunning(dir)
 	printRunState(w, st, running, time.Now())
+	if trayOwnsNotices {
+		if trayIsRunning(dir) {
+			fmt.Fprintln(w, "Tray icon: running (taskbar hidden icons, the ^ arrow).")
+		} else {
+			fmt.Fprintln(w, "Tray icon: not running. `cloudsync start` brings it back.")
+		}
+	}
 
 	db, err := peekState()
 	if err != nil {

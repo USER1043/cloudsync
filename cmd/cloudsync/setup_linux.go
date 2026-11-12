@@ -147,6 +147,14 @@ func (s *systemdUser) halt() error {
 
 func (s *systemdUser) logHint() string { return "journalctl --user -u " + s.unit }
 
+// refresh has nothing to do: the unit file is written by register.
+func (s *systemdUser) refresh() error { return nil }
+
+// There is no tray on Linux: run shows the notifications itself.
+const trayOwnsNotices = false
+
+func watchControl(context.Context, placement, func(ctlOp)) {}
+
 // watchStopRequests isn't needed on Linux: systemd stops `run` with
 // SIGTERM.
 func watchStopRequests(context.Context, placement, func()) {}

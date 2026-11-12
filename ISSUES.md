@@ -13,10 +13,12 @@ small uploads, Windows locking the running `.exe`) are recorded in
 
 In this order. Discuss the design with the owner before coding.
 
-1. **Turn on `cloudsync start` on Windows** for the real root, from a
-   normal terminal (see #9).
+1. **First release (#13):** push a tag, install `cloudsync-setup.exe` on
+   Windows, then turn on `cloudsync start` for the real root from a normal
+   terminal (see #9).
 2. **Check by eye on Windows,** since these can't be tested from a script:
-   - the tray icon and its notifications;
+   - the tray icon: its menu (every item), colours and tooltip (#14), and
+     its notifications;
    - the shutdown screen ("CloudSync is preventing shutdown") with an
      upload in progress, and "shut down anyway";
    - that CloudSync starts after signing out and in again.
@@ -297,3 +299,37 @@ In this order. Discuss the design with the owner before coding.
 - **Possible fix:** forget the folder's record when it is kept (it is then
   a local-only folder with nothing to sync), or have `reconcile.Skips`
   cover folders whose only contents are unsynced. Decide with the owner.
+
+## 13. No installer: the program was only copied by `cloudsync start`, and wasn't on the Windows PATH
+
+- **Found:** 2026-11-11, while turning on `cloudsync start` on Windows.
+- **Symptom:** the program sits in `%LocalAppData%\Programs\CloudSync`,
+  which isn't on the PATH, so every command had to be typed as
+  `& "$env:LOCALAPPDATA\Programs\CloudSync\cloudsync.exe" stop`. Installing
+  was also hidden inside `start`, and there was nothing to release on
+  GitHub.
+- **Solved (written, not yet tried):** a release workflow builds
+  `cloudsync-setup.exe` (Inno Setup, adds the PATH entry) and a Linux
+  tarball with `install.sh` (see `DECISIONS.md`, "Running in the
+  background"). `start` stays as it was, with no PATH change.
+- **To check:** push a first tag, then run the setup on Windows: PATH works
+  in a new terminal, updating over a running CloudSync stops and restarts
+  it, and uninstalling removes the PATH entry. The Inno script has never
+  been compiled; CI is its first build.
+
+## 14. The Windows tray icon had no menu and vanished with the sync
+
+- **Found:** 2026-11-12.
+- **Symptom:** the taskbar icon only carried balloons. It lived inside `cloudsync run`, so stopping the sync removed it, and there was no way to see
+  the status, pause, or start the sync from it.
+- **Solved (written and smoke-tested, not yet tried by eye):** the icon is now
+  its own process, `cloudsync tray` (see `DECISIONS.md`), with a menu and a
+  colour and tooltip that follow the status. The sync gained Sync now / Pause /
+  Resume, driven by named events. `start` brings back a missing tray or sync;
+  `stop` and `update` close both.
+- **Checked:** unit tests for the menu, status mapping, warning diff and
+  lock; the tray starts, holds its lock, a second copy exits, and `stop`
+  closes it. **To check by eye:** the menu items, icon colours (the icons are
+  drawn at runtime with `CreateIconFromResourceEx`; if one shows as the
+  default application icon, that call failed), balloons from the tray, Exit
+  then `start`, and the Start Menu shortcut after a release build.

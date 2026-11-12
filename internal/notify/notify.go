@@ -5,7 +5,8 @@
 // Linux: the freedesktop.org notification service on the session bus,
 // which KDE Plasma (and GNOME) show like any app's notifications.
 // Windows: a CloudSync icon in the notification area, whose balloon
-// messages Windows 10 and 11 show as notifications.
+// messages Windows 10 and 11 show as notifications. The icon also has a
+// menu (Controls) and a colour and tooltip that follow the sync (SetState).
 //
 // A Notifier never repeats itself: the same message under the same key is
 // shown at most once an hour, and a new message replaces the last one with
@@ -97,6 +98,33 @@ func (n *Notifier) Clear(key string) {
 	if _, ok := n.last[key]; ok {
 		delete(n.last, key)
 		n.b.clear(key)
+	}
+}
+
+// controller is a backend that has a tray icon with a menu (Windows).
+type controller interface {
+	setControls(Controls)
+	setState(st State, text string)
+}
+
+// SetControls gives the tray icon its menu (Windows; elsewhere, and for a
+// nil Notifier, it does nothing).
+func (n *Notifier) SetControls(c Controls) {
+	if n == nil {
+		return
+	}
+	if cb, ok := n.b.(controller); ok {
+		cb.setControls(c)
+	}
+}
+
+// SetState sets the tray icon's colour and tooltip.
+func (n *Notifier) SetState(st State, text string) {
+	if n == nil {
+		return
+	}
+	if cb, ok := n.b.(controller); ok {
+		cb.setState(st, text)
 	}
 }
 

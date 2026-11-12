@@ -111,8 +111,34 @@ and change one only after discussing it. Problems and open work are in
   (no admin needed) and not a Session-0 service (it can't reach the user's
   keyring or show notifications). It runs a windowless copy of the program,
   logs to a file, and stops through a named event.
+- **Windows tray is its own process** (`cloudsync tray`, the windowless copy
+  again), and it is what the Startup entry runs. It owns the taskbar icon, so
+  the icon survives stopping the sync and can start it again; the sync
+  (`cloudsync run`) is a child it launches. It reads `status.json` and the
+  run lock to show state, and asks the sync to sync now, pause or resume
+  through named events (like the stop event). Menu: status, Sync now,
+  Pause/Resume, Stop/Start sync, Open folder, Open log, Start at login, Exit.
+  *Pause* keeps the process but holds uploads (a shutdown or stop still
+  uploads); *Stop sync* ends the process after its flush but keeps the tray
+  and login entry; *Exit* stops the sync, then the tray, but keeps start at
+  login. `cloudsync start` brings back whichever is missing; `stop` and
+  `update` close both, since both hold the program file. A second tray
+  exits at once (a lock file). At login the tray starts the sync, so Stop
+  sync lasts until the next login.
 - **Scratch configs** get their own unit or entry name and program copy,
   so testing never touches the real setup.
+- **Installing is separate from `start`.** Releases are built by GitHub
+  Actions when a `v*` tag is pushed: a Windows installer
+  (`cloudsync-setup.exe`, Inno Setup, per-user, no admin) and a Linux
+  tarball with `install.sh`. The installer puts the program in the same
+  place `start` uses, adds it to the PATH (Windows; `~/.local/bin` is
+  already on it on Linux), and offers to run `start` on its last page,
+  unchecked by default because `start` needs the sign-in and first sync.
+  `start` still installs the program itself when it isn't installed (a
+  build from source), but never touches the PATH. The Windows build ships
+  the windowless background copy as a second build (`-H=windowsgui`).
+  The installers are not code-signed, so Windows SmartScreen warns on first
+  run.
 
 ## Notifications and errors
 
@@ -122,8 +148,10 @@ and change one only after discussing it. Problems and open work are in
   Google failing 10+ min. Never for routine syncs, retries or rate limits.
   The same message at most once an hour; a resolved problem takes its
   notification down.
-- **Linux:** freedesktop notifications on the session bus. **Windows:** a
-  tray icon whose balloons show as notifications.
+- **Linux:** freedesktop notifications on the session bus, from `run`.
+  **Windows:** the tray process shows balloons for the warnings `run` keeps
+  in `status.json` (it has no icon of its own), and takes them down when
+  the warning is gone.
 - **Errors explain themselves,** each with its cause and fix. Offline:
   changes wait and retry when the network is back. Sign-in expired or
   revoked: "run `cloudsync login`". Drive full: pause uploads and say which

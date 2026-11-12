@@ -68,9 +68,16 @@ type service interface {
 	registered() bool // set to start at login
 	register() error  // start at login from now on
 	unregister() error
-	launch() error // start now
-	halt() error   // stop now, letting it upload its last changes first
+	refresh() error // bring the login entry up to date with this program, if it is registered
+	launch() error  // start now
+	halt() error    // stop now, letting it upload its last changes first
 	logHint() string
+}
+
+// anythingRunning reports whether the sync, or on Windows the tray, runs:
+// both hold the program file, so neither may be there when it is replaced.
+func anythingRunning(p placement) bool {
+	return runIsRunning(p.stateDir) || (trayOwnsNotices && trayIsRunning(p.stateDir))
 }
 
 // installProgram copies this program to p.exe (and, on Windows, its
@@ -179,10 +186,11 @@ func waitRunning(p placement) bool {
 	return runIsRunning(p.stateDir)
 }
 
-// waitStopped waits until no `cloudsync run` holds its lock.
+// waitStopped waits until no `cloudsync run` (nor, on Windows, tray) holds
+// its lock.
 func waitStopped(p placement, limit time.Duration) bool {
 	deadline := time.Now().Add(limit)
-	for runIsRunning(p.stateDir) {
+	for anythingRunning(p) {
 		if time.Now().After(deadline) {
 			return false
 		}
@@ -276,8 +284,12 @@ func runStart(ctx context.Context, args []string) error {
 			return fmt.Errorf("setting CloudSync to start at login: %w", err)
 		}
 		fmt.Fprintln(w, "CloudSync now starts automatically when you log in.")
+	} else if err := svc.refresh(); err != nil {
+		fmt.Fprintf(w, "Note: couldn't update the start-at-login entry (%v).\n", err)
 	}
-	if runIsRunning(p.stateDir) {
+	// On Windows the tray icon is what the owner exits, so it can be gone
+	// while the sync still runs.
+	if runIsRunning(p.stateDir) && (!trayOwnsNotices || trayIsRunning(p.stateDir)) {
 		fmt.Fprintln(w, "It's already running. Check on it with `cloudsync status`.")
 		return nil
 	}
@@ -288,6 +300,9 @@ func runStart(ctx context.Context, args []string) error {
 		return fmt.Errorf("CloudSync didn't start; its log says why: %s", svc.logHint())
 	}
 	fmt.Fprintf(w, "It's running now.\nCheck on it any time:  cloudsync status\nSee its log:           %s\n", svc.logHint())
+	if trayOwnsNotices {
+		fmt.Fprintln(w, "Its icon is in the taskbar's hidden icons (the ^ arrow): click it for the menu.")
+	}
 	return nil
 }
 
@@ -305,7 +320,7 @@ func runStop(ctx context.Context, args []string) error {
 	}
 	w := os.Stdout
 	wasRegistered := svc.registered()
-	if runIsRunning(p.stateDir) || wasRegistered {
+	if anythingRunning(p) || wasRegistered {
 		fmt.Fprintln(w, "Stopping CloudSync; it uploads its last changes first...")
 		if err := svc.halt(); err != nil {
 			return fmt.Errorf("stopping CloudSync: %w", err)
@@ -366,7 +381,7 @@ func runUpdate(ctx context.Context, args []string) error {
 	old := installedVersion(p.exe)
 	fmt.Fprintf(w, "Updating CloudSync from %s to %s.\n", old, buildVersion())
 
-	running := runIsRunning(p.stateDir)
+	running := anythingRunning(p)
 	if running {
 		fmt.Fprintln(w, "Stopping the running copy; it uploads its last changes first...")
 		if err := svc.halt(); err != nil {
@@ -382,6 +397,9 @@ func runUpdate(ctx context.Context, args []string) error {
 	if !running && !svc.registered() {
 		fmt.Fprintln(w, "Updated. CloudSync isn't set to run in the background; `cloudsync start` turns it on.")
 		return nil
+	}
+	if err := svc.refresh(); err != nil {
+		fmt.Fprintf(w, "Note: couldn't update the start-at-login entry (%v).\n", err)
 	}
 	if err := svc.launch(); err == nil && waitRunning(p) {
 		fmt.Fprintf(w, "Updated and running %s. The previous version is kept as %s.previous.\n", buildVersion(), p.exe)

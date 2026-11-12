@@ -37,11 +37,24 @@ Commands: `login`, `logout`, `whoami`, `init`, `plan`, `sync`, `deletes`,
 | `status.go` | `statusKeeper` writes `status.json` in the state folder (state, detail, recent warnings); `run.lock` marks `run` as running (one instance); `cloudsync status` |
 | `setup.go` | `start`/`stop`/`update`, `place` (usual vs scratch placement), the `service` interface |
 | `setup_linux.go` | systemd user unit |
-| `setup_windows.go` | Startup entry, windowless copy, stop event, `run --log-file/--config/--state-dir` |
+| `setup_windows.go` | Startup entry (runs `tray`), windowless copy, named events (stop, trayexit, syncnow, pause, resume), `launchTray/launchRun/haltRun`, `run --log-file` and `tray` with `--config/--state-dir` |
+| `tray_windows.go` | `cloudsync tray`: the icon's process. Takes `tray.lock`, starts `run`, polls `status.json` every second for the icon state and new warnings (balloons), builds the menu's `Controls` |
+| `control.go` | Tray helpers that need no Windows: `trayState`, `statusLine`, `warningDiff`, `tray.lock`, `readStatus`, and `ctlOp` (sync now / pause / resume) that `run`'s live loop handles |
 | `pe.go` | `makeWindowless`: patches the PE subsystem, like `editbin` |
 | `logfile.go` | Rotating log, 5 MB + 1 old |
 | `version.go` | Git commit as the version (`buildVersion`) |
 | `progress.go` | Terminal progress bar |
+
+### `installer/` and `.github/workflows/release.yml`: releases
+
+Pushing a tag like `v0.1.0` builds and publishes a GitHub release with
+`cloudsync-setup.exe` and `cloudsync-linux-amd64.tar.gz`.
+
+| File | Role |
+|---|---|
+| `installer/cloudsync.iss` | Inno Setup script for the Windows installer: per-user, to `%LocalAppData%\Programs\CloudSync`, adds that folder to the user PATH, stops a running CloudSync before replacing it (and restarts it afterwards), offers `cloudsync start` on the last page, uninstalls cleanly |
+| `installer/install.sh` | Ships in the Linux archive: copies `cloudsync` to `~/.local/bin` and warns if that isn't on the PATH; if already installed it runs `cloudsync update` instead |
+| `.github/workflows/release.yml` | Windows job (checks, console + `-H=windowsgui` builds, ISCC), Linux job (checks, static build, tarball), then a release job |
 
 ### `internal/config`
 
@@ -160,4 +173,8 @@ an hour; a new message replaces its key's last one; `Clear` when the
 problem is gone; a nil `*Notifier` is a no-op. Linux:
 `org.freedesktop.Notifications` on the session bus (critical ones stay
 until dismissed). Windows: a tray icon (`Shell_NotifyIconW`) on a hidden
-window; balloons show as notifications.
+window; balloons show as notifications. The icon also has a right/left-click
+menu (`menu.go`: `Controls`, `Snapshot`, the pure `buildMenu` and
+`choose`; `menu_windows.go` draws it with `TrackPopupMenu`) and a colour
+and tooltip set with `SetState` (`icon.go` draws a cloud with a symbol per state (tick, sync arrows, !, cross, pause, stop) at runtime, at the display's tray size,
+no image files). Only `cloudsync tray` uses these.

@@ -35,7 +35,8 @@ Replace this section when it changes; don't add to it.
   `start`/`stop`/`update`.
 - **Fedora:** in sync and running in the background from login.
 - **Windows:** in sync with Drive, in Fedora's layout. Not yet running in
-  the background.
+  the background. The background side is a tray icon process (`cloudsync
+  tray`) that manages the sync; built and smoke-tested, not yet checked by eye.
 - What comes next is listed in `ISSUES.md` under "Next steps".
 
 ## Build and test

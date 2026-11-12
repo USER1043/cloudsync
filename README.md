@@ -16,15 +16,37 @@ screen) is built but not yet tested on Windows.
 
 ## Set it up yourself
 
-You need about 20 minutes, a Google account, and Go 1.26 or newer.
+You need about 20 minutes and a Google account (plus Go 1.26 or newer if you
+build it yourself).
 
-### 1. Build
+### 1. Install, or build
+
+**Windows:** download `cloudsync-setup.exe` from the
+[latest release](https://github.com/USER1043/cloudsync/releases/latest) and
+run it. It installs for your user only (no administrator rights), adds
+CloudSync to your PATH, and can be removed from *Apps*. Windows may warn
+that the file is from an unknown publisher; choose *More info → Run anyway*.
+
+**Linux:** download `cloudsync-linux-amd64.tar.gz` from the same page, then:
+
+```bash
+tar xzf cloudsync-linux-amd64.tar.gz
+cd cloudsync-linux-amd64 && ./install.sh
+```
+
+Open a new terminal afterwards so `cloudsync` is found. To update later,
+run the new installer or `install.sh`; it keeps your settings and sign-in.
+
+**Or build it yourself** (needs Go 1.26 or newer):
 
 ```bash
 git clone https://github.com/USER1043/cloudsync.git
 cd cloudsync
 go build -o bin/ ./cmd/cloudsync
 ```
+
+Then run it as `bin/cloudsync` (`bin\cloudsync.exe` on Windows); `cloudsync
+start` installs it for you later.
 
 ### 2. Create your own Google sign-in client
 
@@ -71,7 +93,8 @@ already exist in Drive.
 Linux, `%LocalAppData%\Programs\CloudSync` on Windows), sets it to start at
 login (a systemd user service on Linux; a Startup entry on Windows, which
 Task Manager's *Startup apps* lists) and starts it now. You only run it once
-per computer. After building a newer version, run `cloudsync update` from
+per computer. On Windows what starts at login is the tray icon (see below),
+which starts the sync. After building a newer version, run `cloudsync update` from
 the new build; `cloudsync stop` turns the background sync off.
 
 ### 4. On the second computer (or the other OS)
@@ -152,10 +175,27 @@ boot or login), or when you run `cloudsync sync` by hand.
   from sleep and when the network returns) would be a small change; it isn't
   built because its author doesn't need it.
 
+### The Windows tray icon
+
+On Windows CloudSync lives in the taskbar's hidden icons (the ^ arrow). The
+icon's colour and tooltip show the sync's state (green in sync, blue
+working, amber offline or retrying, red failing or needs you, grey paused or
+stopped). Click it for a menu:
+
+- **Sync now**, and **Pause / Resume syncing**. Pausing holds uploads until
+  you resume; the next pass picks up everything changed meanwhile. A
+  shutdown or stop still uploads first.
+- **Stop sync / Start sync.** Stop uploads the last changes and ends the
+  background sync; the icon stays, so you can start it again. (It starts
+  again at the next login.)
+- **Open folder**, **Open log**, and a **Start at login** switch.
+- **Exit** stops the sync (after its last uploads) and closes the icon. Run
+  `cloudsync start` or use the *CloudSync* Start Menu entry to bring it back.
+
 ### Notifications
 
 `cloudsync run` stays quiet while things work. It shows a desktop
-notification (KDE/GNOME on Linux; a CloudSync icon in the Windows taskbar)
+notification (KDE/GNOME on Linux; on Windows the tray icon shows them)
 only for:
 
 - another computer that shut down before uploading everything (which files
@@ -214,7 +254,7 @@ their problem is gone. `cloudsync status` lists recent ones.
 | `config.toml`, `client_secret.json` | `%AppData%\cloudsync` | `~/.config/cloudsync` |
 | Sign-in token | Credential Manager | Secret Service keyring |
 | Sync records (`state.db`), `status.json` | `%LocalAppData%\cloudsync` | `~/.local/state/cloudsync` |
-| Installed program (`cloudsync start`) | `%LocalAppData%\Programs\CloudSync` | `~/.local/bin/cloudsync` |
+| Installed program (setup or `cloudsync start`) | `%LocalAppData%\Programs\CloudSync` | `~/.local/bin/cloudsync` |
 | Background sync's log | `%LocalAppData%\cloudsync\cloudsync.log` | `journalctl --user -u cloudsync` |
 | Started at login by | Startup entry `CloudSync` (Task Manager → Startup apps) | `~/.config/systemd/user/cloudsync.service` |
 
