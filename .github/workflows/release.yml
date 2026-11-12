@@ -28,11 +28,15 @@ jobs:
           go test ./...
       - name: Build the programs
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           mkdir -p dist
-          go build -o dist/cloudsync.exe ./cmd/cloudsync
+          # `cloudsync version` shows the release number, e.g. 0.1.0.
+          v="${TAG#v}"
+          go build -ldflags "-X main.version=$v" -o dist/cloudsync.exe ./cmd/cloudsync
           # The copy that runs at login has no console window.
-          go build -ldflags "-H=windowsgui" -o dist/cloudsync-background.exe ./cmd/cloudsync
+          go build -ldflags "-H=windowsgui -X main.version=$v" -o dist/cloudsync-background.exe ./cmd/cloudsync
       - name: Build the installer
         shell: pwsh
         env:
@@ -62,10 +66,12 @@ jobs:
           go vet ./...
           go test ./...
       - name: Build the archive
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           name=cloudsync-linux-amd64
           mkdir -p "dist/$name"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o "dist/$name/cloudsync" ./cmd/cloudsync
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.version=${TAG#v}" -o "dist/$name/cloudsync" ./cmd/cloudsync
           cp installer/install.sh "dist/$name/install.sh"
           chmod 755 "dist/$name/cloudsync" "dist/$name/install.sh"
           tar -C dist -czf "dist/$name.tar.gz" "$name"

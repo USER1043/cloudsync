@@ -333,3 +333,18 @@ In this order. Discuss the design with the owner before coding.
   drawn at runtime with `CreateIconFromResourceEx`; if one shows as the
   default application icon, that call failed), balloons from the tray, Exit
   then `start`, and the Start Menu shortcut after a release build.
+
+## 15. The installed program said `cloudsync dev`, and the installer changed PATH without telling
+
+- **Found:** 2026-11-12, trying `cloudsync-setup.exe` on Windows.
+- **Symptom:** `cloudsync version` printed `cloudsync dev`. The installer
+  also added its folder to the PATH with no mention, unlike most installers.
+- **Cause:** Go records the git commit in a build only if `git` is on the
+  PATH when it builds; it wasn't, so the version fell back to `dev`. The
+  release workflow never passed a version either. The PATH entry was an
+  unconditional `[Registry]` line.
+- **Solved:** the release workflow now builds with `-X main.version=<tag>`,
+  so `cloudsync version` shows e.g. `0.1.0` (the Inno `AppVersion` was
+  already the tag). The installer has an *Add CloudSync to my PATH* task on
+  its *Select Additional Tasks* page, ticked by default. Compiles on Inno
+  Setup 6.7.3; the new page was not yet seen running.

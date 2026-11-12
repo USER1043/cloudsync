@@ -103,7 +103,9 @@ and change one only after discussing it. Problems and open work are in
   the program file. `update` is run from the new build: it refuses if not
   installed or if run from the installed copy, says "already up to date" if
   identical, and otherwise stops, keeps `.previous`, starts and checks it
-  runs, else restores the previous one. Versions come from git.
+  runs, else restores the previous one. Versions come from git; release
+  builds are stamped with the tag instead (`-X main.version`), since a build
+  made without git on the PATH has no commit to record and says `dev`.
 - **Linux:** `~/.local/bin/cloudsync` and a systemd **user** unit tied to
   `graphical-session.target`, `Restart=on-failure`; exit status 3 (needs
   the owner) is not restarted.
@@ -131,7 +133,8 @@ and change one only after discussing it. Problems and open work are in
   Actions when a `v*` tag is pushed: a Windows installer
   (`cloudsync-setup.exe`, Inno Setup, per-user, no admin) and a Linux
   tarball with `install.sh`. The installer puts the program in the same
-  place `start` uses, adds it to the PATH (Windows; `~/.local/bin` is
+  place `start` uses, adds it to the PATH (Windows, as an *Additional tasks*
+  tick-box that is on by default; `~/.local/bin` is
   already on it on Linux), and offers to run `start` on its last page,
   unchecked by default because `start` needs the sign-in and first sync.
   `start` still installs the program itself when it isn't installed (a

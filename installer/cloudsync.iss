@@ -38,9 +38,13 @@ SetupLogging=yes
 Source: "..\dist\cloudsync.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\dist\cloudsync-background.exe"; DestDir: "{app}"; Flags: ignoreversion
 
+[Tasks]
+; Shown on the "Select Additional Tasks" page, ticked by default.
+Name: "addtopath"; Description: "Add CloudSync to my PATH, so ""cloudsync"" works in any new terminal"; GroupDescription: "Command line:"
+
 [Registry]
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; \
-  ValueData: "{olddata};{app}"; Check: NeedsAddPath('{app}')
+  ValueData: "{olddata};{app}"; Tasks: addtopath; Check: NeedsAddPath('{app}')
 
 [Icons]
 ; Brings the tray icon (and the sync it manages) back after Exit. A second
