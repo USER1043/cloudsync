@@ -18,7 +18,7 @@ the owner's iPhone through the Google Drive app.
 
 | | Windows | Fedora | Google Drive |
 |---|---|---|---|
-| Synced folder | `C:\MyFiles` | `~/My_Files` | `My Drive/CloudSync/MyFiles` |
+| Synced folder | `C:\MyFiles` | `~/MyFiles` (was `~/My_Files` until 2026-11-23) | `My Drive/CloudSync/MyFiles` |
 | Config | `%AppData%\cloudsync\config.toml` | `~/.config/cloudsync/config.toml` | |
 | State DB | `%LocalAppData%\cloudsync\state.db` | `~/.local/state/cloudsync/state.db` | |
 | Installed program | `%LocalAppData%\Programs\CloudSync` | `~/.local/bin/cloudsync` | |

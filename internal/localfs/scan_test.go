@@ -1,6 +1,8 @@
 package localfs
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -190,8 +192,10 @@ func TestScanTranslatesStandIns(t *testing.T) {
 
 func TestScanMissingRoot(t *testing.T) {
 	m, _ := filter.New(nil)
-	if _, err := Scan(filepath.Join(t.TempDir(), "nope"), m, nil); err == nil {
-		t.Error("expected an error for a missing root")
+	_, err := Scan(filepath.Join(t.TempDir(), "nope"), m, nil)
+	var rm *RootMissingError
+	if !errors.As(err, &rm) || !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("Scan of a missing root: %v; want a *RootMissingError wrapping fs.ErrNotExist", err)
 	}
 }
 

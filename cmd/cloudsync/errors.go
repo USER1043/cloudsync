@@ -14,6 +14,7 @@ import (
 	"google.golang.org/api/googleapi"
 
 	"github.com/USER1043/cloudsync/internal/gdrive"
+	"github.com/USER1043/cloudsync/internal/localfs"
 )
 
 // googleStatus is where Google reports outages of its services.
@@ -114,6 +115,12 @@ func describe(err error) string {
 		ge *googleapi.Error
 		pe *fs.PathError
 	)
+	var rm *localfs.RootMissingError
+	if errors.As(err, &rm) {
+		return fmt.Sprintf("the folder %s doesn't exist. If you moved or renamed it, change its path in config.toml "+
+			"(`path` under its root) and restart CloudSync; if it's on a drive that isn't connected, connect it. "+
+			"Nothing is deleted meanwhile", rm.Root)
+	}
 	switch classify(err) {
 	case kindRoot:
 		errors.As(err, &re)

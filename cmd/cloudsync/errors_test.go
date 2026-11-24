@@ -14,6 +14,8 @@ import (
 
 	"golang.org/x/oauth2"
 	"google.golang.org/api/googleapi"
+
+	"github.com/USER1043/cloudsync/internal/localfs"
 )
 
 func TestDescribe(t *testing.T) {
@@ -45,6 +47,8 @@ func TestDescribe(t *testing.T) {
 			kindLocal, "permission denied for /home/u/My_Files/a.pdf", ""},
 		{"disk full", &fs.PathError{Op: "write", Path: "/x", Err: syscall.ENOSPC}, kindLocal, "disk is full", ""},
 		{"vanished", &fs.PathError{Op: "stat", Path: "/x/b.txt", Err: fs.ErrNotExist}, kindLocal, "disappeared", ""},
+		{"local folder gone", fmt.Errorf("root %q: %w", "MyFiles", &localfs.RootMissingError{Root: "/home/u/My_Files"}),
+			kindOther, "the folder /home/u/My_Files doesn't exist. If you moved or renamed it, change its path in config.toml", "disappeared"},
 		{"unknown", errors.New("something odd"), kindOther, "something odd", ""},
 	} {
 		if got := classify(c.err); got != c.kind {

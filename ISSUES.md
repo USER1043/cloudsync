@@ -348,3 +348,22 @@ In this order. Discuss the design with the owner before coding.
   already the tag). The installer has an *Add CloudSync to my PATH* task on
   its *Select Additional Tasks* page, ticked by default. Compiles on Inno
   Setup 6.7.3; the new page was not yet seen running.
+
+## 16. A renamed sync folder was reported as "disappeared while syncing"
+
+- **Found:** 2026-11-24, on Fedora, after the owner renamed the synced
+  folder (`~/My_Files` → `~/MyFiles`) on 2026-11-23.
+- **Symptom:** `cloudsync run` failed every catch-up and live pass for over
+  a day with "`<folder>` disappeared while syncing (moved or deleted
+  meanwhile); the next pass catches up", and after 10 minutes notified
+  "CloudSync keeps failing". The message suggested a passing hiccup, so it
+  didn't say what to do. Nothing was deleted (a missing root is an error,
+  not an empty scan), but nothing synced either.
+- **Cause:** `localfs.Scan` returned the root's `stat` error as a plain
+  `*fs.PathError`, which `describe` reads as a single file vanishing mid-sync.
+- **Fix:** `Scan` returns a `*localfs.RootMissingError` (still
+  `fs.ErrNotExist` for `errors.Is`). `describe` says the folder doesn't
+  exist and to change `path` in `config.toml` and restart, or connect the
+  drive it's on; `cloudsync run` notifies at once ("CloudSync can't find
+  your synced folder") and keeps retrying, so a drive plugged back in still
+  recovers on its own. Tested in `errors_test.go` and `scan_test.go`.

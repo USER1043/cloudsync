@@ -20,6 +20,7 @@ import (
 	"github.com/USER1043/cloudsync/internal/engine"
 	"github.com/USER1043/cloudsync/internal/filter"
 	"github.com/USER1043/cloudsync/internal/gdrive"
+	"github.com/USER1043/cloudsync/internal/localfs"
 	"github.com/USER1043/cloudsync/internal/notify"
 	"github.com/USER1043/cloudsync/internal/reconcile"
 	"github.com/USER1043/cloudsync/internal/shutdown"
@@ -225,6 +226,14 @@ func (dm *daemon) trouble(err error) {
 	default:
 		if dm.troubleSince.IsZero() {
 			dm.troubleSince = now
+		}
+		// A missing local folder needs the owner, so it is told at once.
+		var rm *localfs.RootMissingError
+		if errors.As(err, &rm) {
+			dm.st.set("folder not found", msg)
+			dm.alert(notify.Message{Key: "trouble", Title: "CloudSync can't find your synced folder",
+				Body: msg + ". CloudSync keeps trying."})
+			return
 		}
 		title := "CloudSync keeps failing"
 		if classify(err) == kindGoogle {

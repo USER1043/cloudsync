@@ -39,6 +39,16 @@ type Result struct {
 	Matcher *filter.Matcher
 }
 
+// RootMissingError is a sync root folder that doesn't exist, usually
+// because it was moved or renamed, or is on a drive that isn't connected.
+// It is not a reason to delete anything: the files are elsewhere.
+type RootMissingError struct{ Root string }
+
+func (e *RootMissingError) Error() string { return "sync root " + e.Root + " does not exist" }
+
+// Unwrap lets errors.Is(err, fs.ErrNotExist) see it.
+func (e *RootMissingError) Unwrap() error { return fs.ErrNotExist }
+
 // maxRelPath keeps root-relative paths short enough to stay within Windows'
 // 260-character limit once the root folder is prefixed.
 const maxRelPath = 240
@@ -52,6 +62,9 @@ const maxRelPath = 240
 // which local names are taken; on Linux it is nil.
 func Scan(root string, m *filter.Matcher, names *winname.Map) (*Result, error) {
 	info, err := os.Stat(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, &RootMissingError{Root: root}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("sync root: %w", err)
 	}
