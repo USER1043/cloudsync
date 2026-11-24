@@ -25,12 +25,18 @@ In this order. Discuss the design with the owner before coding.
 3. **Still untested on Windows:** `update` going back to the previous
    version when the new build doesn't start; behaviour when offline; the
    Recycle Bin refusing a file.
-4. **Kept folders listed in every plan** (#12).
-5. **Rename detection** (#6): move instead of upload + trash.
-6. **`client_secret.json` permissions** (#4).
-7. **Adaptive big-delete guard:** tune the threshold from the delete log
+4. **Check on Fedora** the Linux side of the Windows-session changes, now
+   running there but not yet tried: the tray-manager controls in
+   `control.go` (sync now, pause, resume) and the changes to `run.go`,
+   `setup.go` and `setup_linux.go`; and, after the first release, the
+   Linux tarball with `installer/install.sh`, both a fresh install and
+   one over a running CloudSync (it should run `update`).
+5. **Kept folders listed in every plan** (#12).
+6. **Rename detection** (#6): move instead of upload + trash.
+7. **`client_secret.json` permissions** (#4).
+8. **Adaptive big-delete guard:** tune the threshold from the delete log
    once there is data. It must never loosen the guard silently.
-8. **Optional, only if the owner asks:** a Drive change-feed check every
+9. **Optional, only if the owner asks:** a Drive change-feed check every
    ~10 min, on resume from sleep and on network return.
 
 ## Issues

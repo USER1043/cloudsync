@@ -82,7 +82,9 @@ and change one only after discussing it. Problems and open work are in
   KDE's Shut Down silently does nothing (no message, no "shut down
   anyway"). Instead a logind **delay** inhibitor (max 5 s) gives time to
   upload the list, then the SIGTERM flush gets the user unit's stop time
-  (about 40 s; skipped at once when offline).
+  (about 40 s; skipped at once when offline). Keep the flush under 45 s:
+  that's how long Fedora waits for a user service to stop before killing
+  it.
 - **Windows blocks** ("CloudSync is preventing shutdown: uploading N
   files"), **but not when offline**: waiting can't help.
 - **Sleep is never blocked** (a laptop in a bag must sleep).
